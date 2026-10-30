@@ -126,7 +126,12 @@ export const truncate = (text: string, max: number): string =>
 const QUESTION_HINT =
   /\?|\b(decide|decision|approv\w*|confirm|your call|let me know|should I|which (option|approach)|need(s)? (your|human|a human)|sign[- ]off|feedback|preference)\b/i
 
-export const mightHoldQuestions = (answer: string): boolean => QUESTION_HINT.test(answer)
+// A report that says it has no questions for the user is taken at its word:
+// its other lines ("merge?", "push?" under manager notes) are not for the human.
+const NO_USER_QUESTIONS = /\buser questions\b[*_\s]*:[*_\s]*(none|n\/a)\b/i
+
+export const mightHoldQuestions = (answer: string): boolean =>
+  !NO_USER_QUESTIONS.test(answer) && QUESTION_HINT.test(answer)
 
 export type Extracted = { kind: AttnKind; question: string; details: string }
 
@@ -196,7 +201,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
       'Review and feedback block nothing: the bead itself is labelled attn:review / attn:feedback, with the request as a comment.',
       'A repeated question (an agent retrying) is matched to the item already filed, not filed again.',
       'The manager and every new subagent are told to use it instead of asking in prose.',
-      'Backup: when a subagent finishes with questions in prose, Haiku extracts them and files them, marked "(auto-extracted)".',
+      'Backup: when a subagent finishes with questions in prose, Haiku extracts them and files them, marked "(auto-extracted)". Skipped when the report says "User questions: none".',
       'You can file one by hand: bd gate create --blocks <id> --title "<question>" --reason "<details>", then bd label add <gate-id> attn:decision',
     ],
   ],

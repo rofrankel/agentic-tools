@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { age, createdId, isFeedbackKind, paneIdFor, parseBead, parseExtracted, parseGates, quickId, sameQuestion, splitIdAndText, statusText } from '../hooks/lib'
+import { age, createdId, isFeedbackKind, mightHoldQuestions, paneIdFor, parseBead, parseExtracted, parseGates, quickId, sameQuestion, splitIdAndText, statusText } from '../hooks/lib'
 
 // Shaped as `bd list --type gate --status open --json` prints (bd 1.3.2).
 const BD_LIST = JSON.stringify([
@@ -162,4 +162,13 @@ test('closed beads still labelled for review stay in the inbox; closed gates do 
   expect(list.map(one => [one.id, one.kind])).toEqual([['p-1', 'review']])
   expect(isFeedbackKind('review') && isFeedbackKind('feedback') && !isFeedbackKind('decision')).toBe(true)
   expect(sameQuestion('  Postgres  or SQLite? ', 'postgres or sqlite?')).toBe(true)
+})
+
+test('a report saying "User questions: none" is not mined for questions', async () => {
+  const report = 'Done: bd-12.\n\nManager notes:\n- merge?\n- push?\n\nUser questions: none'
+
+  expect(mightHoldQuestions(report)).toBe(false)
+  expect(mightHoldQuestions('Manager notes: merge?\n**User questions:** None.')).toBe(false)
+  expect(mightHoldQuestions('Manager notes: merge?\nUser questions:\n- Postgres or SQLite?')).toBe(true)
+  expect(mightHoldQuestions('Should I delete the old table?')).toBe(true)
 })

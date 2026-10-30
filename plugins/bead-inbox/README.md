@@ -47,7 +47,7 @@ The plugin registers an `ask_human` tool and tells the manager and every subagen
 - **Decision, approval or question:** creates a beads human gate labelled `attn:<kind>`. The gate blocks the bead in question, or a new "Follow up: ..." bead if none is given. The agent moves on to other ready work.
 - **Review or feedback:** blocks nothing. The work bead itself is labelled `attn:review` or `attn:feedback`, with the request added as a comment.
 - **Retries:** a repeated question is matched to the item already filed, so it isn't filed twice.
-- **Backup:** when a subagent finishes with questions written in prose, Haiku extracts them and files them, marked "(auto-extracted)".
+- **Backup:** when a subagent finishes with questions written in prose, Haiku extracts them and files them, marked "(auto-extracted)". A report that says `User questions: none` is skipped.
 
 Anything else with an `attn:*` label, or any open human gate, shows up too, so you can file items by hand:
 
