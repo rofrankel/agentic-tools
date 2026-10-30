@@ -17,6 +17,7 @@ import {
   statusText,
   truncate,
   createdId,
+  gateTarget,
   quickId,
   sameQuestion,
   paneIdFor,
@@ -289,19 +290,26 @@ const failed = () => ({ text: 'bead-inbox: the command failed; see the debug log
 const openBead = async ($: Engine, beadId: string) => {
   const paneId = paneIdFor(beadId)
   await update($, loading, ids => [...ids.filter(one => one !== paneId), paneId])
+  // Draw what the inbox already knows at once; bd fills in the rest.
+  const item = (await read($, items)).find(one => one.id === beadId)
+  if (item) {
+    await update($, views, all => (all[paneId] ? all : { ...all, [paneId]: previewOf(item) }))
+  }
   void $.ui.open({ id: paneId, title: beadId })
-  const show = await bd($, ['show', beadId, '--json'])
-  const comments = await bd($, ['comments', beadId, '--json'])
+  // One bd run for the bead, its comments and the bead it blocks: each run
+  // costs about a second, more while the poll or an agent holds the database.
+  const blocksId = item?.blocks
+  const show = await bd($, ['show', beadId, ...(blocksId ? [blocksId] : []), '--include-comments', '--json'])
   let view: BeadView | undefined
   if (show.exitCode === 0) {
     try {
-      const gateOf = /Ad-hoc gate blocking (\S+)/.exec(show.stdout.replace(/\\n/g, '\n'))?.[1]
-      const blocked = gateOf ? await bd($, ['show', gateOf, '--json']) : undefined
-      view = parseBead(
-        show.stdout,
-        comments.exitCode === 0 ? comments.stdout : '[]',
-        blocked?.exitCode === 0 ? blocked.stdout : undefined,
-      )
+      view = parseBead(show.stdout, beadId, blocksId)
+      // A gate the inbox doesn't list (opened from a link): fetch its target.
+      const target = view && !view.blocks && !blocksId ? gateTarget(view.sections[0]?.text) : undefined
+      if (target) {
+        const both = await bd($, ['show', beadId, target, '--include-comments', '--json'])
+        view = both.exitCode === 0 ? (parseBead(both.stdout, beadId, target) ?? view) : view
+      }
     } catch {
       view = undefined
     }
@@ -314,6 +322,21 @@ const openBead = async ($: Engine, beadId: string) => {
   await update($, views, all => ({ ...all, [paneId]: shown }))
   await update($, loading, ids => ids.filter(one => one !== paneId))
 }
+
+const previewOf = (item: AttnItem): BeadView => ({
+  id: item.id,
+  title: item.title,
+  status: '',
+  type: item.isGate ? 'gate' : '',
+  priority: null,
+  labels: item.label ? [item.label] : [],
+  createdAt: item.createdAt,
+  updatedAt: '',
+  sections: item.details ? [{ heading: 'Details', text: item.details }] : [],
+  deps: [],
+  comments: [],
+  blocks: item.blocks ? { id: item.blocks, title: '', status: '', type: '', description: '' } : undefined,
+})
 
 const fillPrompt = ($: Engine, text: string) => $.prompt.fill({ text, mode: 'replace' })
 

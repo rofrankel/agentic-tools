@@ -242,13 +242,15 @@ type RawBead = {
   notes?: string
   close_reason?: string
   dependencies?: RawBead[]
+  comments?: { author?: string; text: string; created_at?: string }[]
 }
 
-const first = (stdout: string): RawBead | undefined => {
+const beads = (stdout: string): RawBead[] => {
   const parsed: unknown = jsonFrom(stdout, [])
-  const one: unknown = Array.isArray(parsed) ? parsed[0] : parsed
 
-  return typeof one === 'object' && one !== null && 'id' in one ? (one as RawBead) : undefined
+  return (Array.isArray(parsed) ? parsed : [parsed]).filter(
+    (one): one is RawBead => typeof one === 'object' && one !== null && 'id' in one,
+  )
 }
 
 const toRef = (raw: RawBead): BeadRef => ({
@@ -258,10 +260,15 @@ const toRef = (raw: RawBead): BeadRef => ({
   type: raw.issue_type ?? '',
 })
 
-// `show` is `bd show <id> --json`, `comments` is `bd comments <id> --json`,
-// `blocked` is `bd show` of the bead a gate blocks, when it is one.
-export const parseBead = (show: string, comments: string, blocked?: string): BeadView | undefined => {
-  const raw = first(show)
+// The bead a gate blocks, read from bd's "Ad-hoc gate blocking X" description.
+export const gateTarget = (description: string | undefined): string | undefined =>
+  /Ad-hoc gate blocking (\S+)/.exec(description ?? '')?.[1]
+
+// `show` is one `bd show <id> [<blocked id>] --include-comments --json`: the
+// bead, and for a gate the bead it blocks, read in a single bd run.
+export const parseBead = (show: string, beadId: string, blocksId?: string): BeadView | undefined => {
+  const all = beads(show)
+  const raw = all.find(one => one.id === beadId) ?? all[0]
   if (!raw) {
     return undefined
   }
@@ -275,8 +282,8 @@ export const parseBead = (show: string, comments: string, blocked?: string): Bea
   const sections = fields.flatMap(([heading, text]) =>
     typeof text === 'string' && text.trim() !== '' ? [{ heading, text: text.trim() }] : [],
   )
-  const parsedComments: unknown = jsonFrom(comments, [])
-  const blockedRaw = blocked ? first(blocked) : undefined
+  const target = blocksId ?? gateTarget(raw.description)
+  const blockedRaw = target === undefined ? undefined : all.find(one => one.id === target && one !== raw)
 
   return {
     id: raw.id,
@@ -290,8 +297,8 @@ export const parseBead = (show: string, comments: string, blocked?: string): Bea
     updatedAt: raw.updated_at ?? '',
     sections,
     deps: (raw.dependencies ?? []).map(toRef),
-    comments: (Array.isArray(parsedComments) ? parsedComments : [])
-      .filter((one): one is { author?: string; text: string; created_at?: string } => typeof one?.text === 'string')
+    comments: (raw.comments ?? [])
+      .filter(one => typeof one?.text === 'string')
       .map(one => ({ author: one.author ?? '', text: one.text, createdAt: one.created_at ?? '' })),
     blocks: blockedRaw ? { ...toRef(blockedRaw), description: blockedRaw.description?.trim() ?? '' } : undefined,
   }

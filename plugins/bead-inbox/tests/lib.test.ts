@@ -110,7 +110,7 @@ test('pane ids keep to the allowed characters', async () => {
   expect(paneIdFor('proj-a1b2.1')).toBe('bead-proj-a1b2_1')
 })
 
-test('a bead, its comments and the bead a gate blocks read into one view', async () => {
+test('a bead, its comments and the bead a gate blocks read from one bd show', async () => {
   const show = JSON.stringify([
     {
       id: 'proj-3l4',
@@ -125,20 +125,20 @@ test('a bead, its comments and the bead a gate blocks read into one view', async
       description: 'Ad-hoc gate blocking proj-a7j\n\nReason: A or B',
       notes: '  ',
       dependencies: [{ id: 'proj-zz', title: 'Spike', status: 'closed', issue_type: 'task' }],
+      comments: [{ id: 'c1', issue_id: 'proj-3l4', author: 'Richard', text: 'leaning B', created_at: '2026-10-30T04:00:00Z' }],
     },
-  ])
-  const comments = JSON.stringify([{ author: 'Richard', text: 'leaning B', created_at: '2026-10-30T04:00:00Z' }])
-  const blocked = JSON.stringify([
     { id: 'proj-a7j', title: 'Cache layer', status: 'blocked', issue_type: 'task', description: 'Build it' },
   ])
-  const view = parseBead(show, comments, blocked)
+  const view = parseBead(show, 'proj-3l4', 'proj-a7j')
 
   expect(view?.sections).toEqual([{ heading: 'Description', text: 'Ad-hoc gate blocking proj-a7j\n\nReason: A or B' }])
   expect(view?.assignee).toBe('richard@frankel.tv')
   expect(view?.deps).toEqual([{ id: 'proj-zz', title: 'Spike', status: 'closed', type: 'task' }])
   expect(view?.comments).toEqual([{ author: 'Richard', text: 'leaning B', createdAt: '2026-10-30T04:00:00Z' }])
   expect(view?.blocks).toEqual({ id: 'proj-a7j', title: 'Cache layer', status: 'blocked', type: 'task', description: 'Build it' })
-  expect(parseBead('[]', '[]')).toBeUndefined()
+  // Without the target passed in, it is found from the gate's description.
+  expect(parseBead(show, 'proj-3l4')?.blocks?.id).toBe('proj-a7j')
+  expect(parseBead('[]', 'proj-3l4')).toBeUndefined()
 })
 
 test('bd output is read through notices printed around the JSON', async () => {
