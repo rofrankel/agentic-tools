@@ -1,0 +1,11 @@
+{
+  "name": "bead-inbox",
+  "version": "0.1.0",
+  "description": "Shows beads human gates (decisions, approvals, questions, reviews, feedback) waiting on you, and lets you answer them without spending model tokens",
+  "author": { "name": "Richard Frankel" },
+  "homepage": "https://github.com/rofrankel/agentic-tools/tree/main/plugins/bead-inbox",
+  "repository": "https://github.com/rofrankel/agentic-tools",
+  "license": "MIT",
+  "keywords": ["beads", "bd", "inbox", "human-in-the-loop", "gates", "subagents"],
+  "types": "./types/index.d.ts"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "rofrankel",
+  "owner": { "name": "Richard Frankel" },
+  "metadata": {
+    "description": "Plugins, skills and tools for working with coding agents"
+  },
+  "plugins": [
+    {
+      "name": "bead-inbox",
+      "source": "./plugins/bead-inbox",
+      "description": "An inbox of the beads human gates and reviews waiting on you, answerable without spending model tokens"
+    }
+  ]
+}
