@@ -64,7 +64,12 @@ const isWanted = (one: RawGate): boolean => {
     return one.status !== 'closed' && (one.await_type === undefined || one.await_type === 'human')
   }
 
-  return (one.labels ?? []).some(label => label.startsWith('attn:'))
+  // A closed bead stays only when it asks for review or feedback on finished
+  // work; a closed decision, approval or question was settled some other way.
+  const labels = (one.labels ?? []).filter(label => label.startsWith('attn:'))
+  return one.status === 'closed'
+    ? labels.some(label => label === 'attn:review' || label === 'attn:feedback')
+    : labels.length > 0
 }
 
 // Takes the stdout of each bd list run (open gates, attn:-labelled issues) and

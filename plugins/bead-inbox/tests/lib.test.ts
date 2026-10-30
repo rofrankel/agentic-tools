@@ -151,11 +151,13 @@ test('bd output is read through notices printed around the JSON', async () => {
   expect(parseGates(`hint: run bd doctor\n${BD_LIST}`).length).toBe(2)
 })
 
-test('closed beads still labelled for review stay in the inbox; closed gates do not', async () => {
+test('closed beads stay only when labelled for review or feedback; closed gates do not', async () => {
   const list = parseGates(
     JSON.stringify([
       { id: 'p-1', title: 'Done work', status: 'closed', issue_type: 'task', created_at: '2026-10-30T00:00:00Z', labels: ['attn:review'] },
       { id: 'p-2', title: 'Old gate', status: 'closed', issue_type: 'gate', created_at: '2026-10-30T00:00:00Z', await_type: 'human' },
+      { id: 'p-3', title: 'Settled question', status: 'closed', issue_type: 'task', created_at: '2026-10-30T00:00:00Z', labels: ['attn:question'] },
+      { id: 'p-4', title: 'Settled decision', status: 'closed', issue_type: 'task', created_at: '2026-10-30T00:00:00Z', labels: ['attn:decision'] },
     ]),
   )
 
