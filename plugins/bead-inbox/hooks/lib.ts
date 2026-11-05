@@ -18,6 +18,71 @@ export const COLOR: Record<AttnKind, string> = {
   feedback: 'subtle',
 }
 
+const PROJECT_PREFIX = 'project:'
+
+// Chip backgrounds: black text reads on each, on light and dark themes alike.
+const PROJECT_COLORS: readonly string[] = [
+  '#f28b82', '#fbbc66', '#fff475', '#b5e550', '#5fd38d', '#6fe0d0',
+  '#7cc4fa', '#a0a8ff', '#d7aefb', '#fdb5dc', '#d2b48c', '#c0c8d0',
+]
+
+export const CHIP_TEXT = '#000000'
+
+// FNV-1a, folded: short, similar names must still spread across the colors.
+const hashOf = (text: string): number => {
+  let hash = 0x811c9dc5
+  for (const char of text) {
+    hash = Math.imul(hash ^ (char.codePointAt(0) ?? 0), 16777619)
+  }
+
+  return (hash ^ (hash >>> 16)) >>> 0
+}
+
+// A project's name picks its color, so it keeps that color from session to
+// session. One that would match another project on screen takes the next free
+// color instead: at a glance, two projects must never look alike.
+export const projectColors = (projects: readonly string[]): ((project: string) => string) => {
+  const colorAt = (index: number) => PROJECT_COLORS[index % PROJECT_COLORS.length] ?? CHIP_TEXT
+  const chosen = new Map<string, string>()
+  for (const project of [...new Set(projects)].sort()) {
+    const start = hashOf(project)
+    const free = PROJECT_COLORS.map((_, step) => colorAt(start + step)).find(
+      color => ![...chosen.values()].includes(color),
+    )
+    chosen.set(project, free ?? colorAt(start))
+  }
+
+  return project => chosen.get(project) ?? colorAt(hashOf(project))
+}
+
+export const chipText = (project: string): string => ` ${truncate(project, 16)} `
+
+// bd splits labels on commas, and a folder name may hold spaces.
+export const cleanProject = (name: string | undefined): string | undefined => {
+  const clean = (name ?? '')
+    .trim()
+    .replace(/^project:/i, '')
+    .replace(/[\s,]+/g, '-')
+    .toLowerCase()
+
+  return clean === '' ? undefined : clean
+}
+
+export const projectLabel = (project: string): string => `${PROJECT_PREFIX}${project}`
+
+export const labelledProject = (labels: readonly string[]): string | undefined =>
+  labels.find(one => one.startsWith(PROJECT_PREFIX))?.slice(PROJECT_PREFIX.length)
+
+// An untagged bead goes by its id prefix, which differs between repos.
+export const projectOf = (id: string, labels: readonly string[]): string =>
+  labelledProject(labels) ?? /^(.+)-[^-]+$/.exec(id)?.[1] ?? id
+
+// With one project in the list a tag on every row would say nothing.
+export const isMixed = (list: AttnItem[]): boolean => new Set(list.map(one => one.project)).size > 1
+
+export const folderName = (path: string): string | undefined =>
+  path.split(/[\\/]/).filter(Boolean).pop()
+
 export type RawGate = {
   id: string
   title: string
@@ -54,6 +119,7 @@ export const toItem = (raw: RawGate): AttnItem => {
     createdAt: raw.created_at,
     isGate: raw.issue_type === 'gate',
     label: label === undefined ? undefined : `attn:${label}`,
+    project: projectOf(raw.id, raw.labels ?? []),
   }
 }
 
@@ -176,6 +242,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
       'Beads that need you: open human gates, and any open issue labelled attn:approval, attn:decision, attn:question, attn:review or attn:feedback.',
       'Status line: a count by kind. Band above the prompt: the top 3, approvals first, then oldest. Toast: when a new one arrives.',
       'It reads bd every 15s and after any bd command or subagent return. Viewing costs no model tokens, and it survives /clear.',
+      'Projects: when the inbox holds more than one project, each row carries a colored project tag. The color comes from the name, so a project usually keeps it across sessions; if two would match, one takes the next free color. A bead\'s project is its project:<name> label, or else its id prefix.',
     ],
   ],
   [
@@ -202,12 +269,13 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
   [
     'How items get filed',
     [
-      'Agents call the ask_human tool (kind, question, details, blocks). Decisions, approvals and questions become a human gate labelled attn:<kind>, blocking the given bead or a new "Follow up: ..." bead.',
+      'Agents call the ask_human tool (kind, question, details, blocks, project). Decisions, approvals and questions become a human gate labelled attn:<kind>, blocking the given bead or a new "Follow up: ..." bead.',
+      'Each item is labelled project:<name>: the project of the bead it concerns if that has one, else the project the agent passed, else the name of the session\'s folder.',
       'Review and feedback block nothing: the bead itself is labelled attn:review / attn:feedback, with the request as a comment.',
       'A repeated question (an agent retrying) is matched to the item already filed, not filed again.',
       'The manager and every new subagent are told to use it instead of asking in prose.',
       'Backup: when a subagent finishes with questions in prose, Haiku extracts them and files them, marked "(auto-extracted)". Skipped when the report says "User questions: none".',
-      'You can file one by hand: bd gate create --blocks <id> --title "<question>" --reason "<details>", then bd label add <gate-id> attn:decision',
+      'You can file one by hand: bd gate create --blocks <id> --title "<question>" --reason "<details>", then bd label add <gate-id> attn:decision,project:<name>',
     ],
   ],
   [
@@ -355,3 +423,9 @@ export const quickId = (stdout: string): string | undefined =>
 
 export const sameQuestion = (a: string, b: string): boolean =>
   a.replace(/\s+/g, ' ').trim().toLowerCase() === b.replace(/\s+/g, ' ').trim().toLowerCase()
+
+// Two projects can ask the same thing ("Merge to main?"); only the same
+// question from the same project is a retry.
+export const isRepeat = (item: AttnItem, question: string, project: string | undefined): boolean =>
+  (project === undefined || item.project === project) &&
+  (sameQuestion(item.title, question) || sameQuestion(item.title, `Follow up: ${truncate(question, 100)}`))

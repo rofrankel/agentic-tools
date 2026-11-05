@@ -3,23 +3,32 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { AttnItem, AttnKind, BeadView } from '../types'
 import {
+  CHIP_TEXT,
   COLOR,
   HELP,
   KINDS,
   TAG,
   age,
+  chipText,
+  cleanProject,
+  folderName,
   isFeedbackKind,
   isKind,
+  isMixed,
+  isRepeat,
+  labelledProject,
   mightHoldQuestions,
   parseExtracted,
   parseGates,
+  projectColors,
+  projectLabel,
+  projectOf,
   splitIdAndText,
   statusText,
   truncate,
   createdId,
   gateTarget,
   quickId,
-  sameQuestion,
   paneIdFor,
   parseBead,
 } from './lib'
@@ -39,7 +48,7 @@ const now = atom({ plugin: 'bead-inbox', key: 'now' } as const, 0)
 const views = atom({ plugin: 'bead-inbox', key: 'views' } as const, {})
 const loading = atom({ plugin: 'bead-inbox', key: 'loading' } as const, [])
 
-const GUIDANCE = `Human attention inbox (bead-inbox plugin): whenever you need a decision, approval, answer, review or feedback from the human, call the ${TOOL_ID} tool instead of only writing the question in prose. Prose questions scroll out of sight during long autonomous runs; the tool puts them in a persistent inbox the human sees. Call it once per distinct question and never retry a call that returned a result. Pass \`blocks\` with the bead the question concerns when there is one. Decisions, approvals and questions become a beads human gate blocking that bead: do not wait, carry on with other ready work; the answer arrives as the gate's close reason and as a comment on the blocked bead. Review and feedback block nothing: they label the bead attn:review or attn:feedback. When the human responds, their notes are a comment on the bead and it carries the ${FEEDBACK_LABEL} label (reopened if it was closed): address the notes, then remove that label (\`bd label remove <id> ${FEEDBACK_LABEL}\`). Check \`bd list --label ${FEEDBACK_LABEL}\` for feedback still to address. When relaying a subagent's questions, file each one with the tool unless the subagent already did.`
+const GUIDANCE = `Human attention inbox (bead-inbox plugin): whenever you need a decision, approval, answer, review or feedback from the human, call the ${TOOL_ID} tool instead of only writing the question in prose. Prose questions scroll out of sight during long autonomous runs; the tool puts them in a persistent inbox the human sees. Call it once per distinct question and never retry a call that returned a result. Pass \`blocks\` with the bead the question concerns when there is one, and \`project\` when the work belongs to a project other than the session's folder. Decisions, approvals and questions become a beads human gate blocking that bead: do not wait, carry on with other ready work; the answer arrives as the gate's close reason and as a comment on the blocked bead. Review and feedback block nothing: they label the bead attn:review or attn:feedback. When the human responds, their notes are a comment on the bead and it carries the ${FEEDBACK_LABEL} label (reopened if it was closed): address the notes, then remove that label (\`bd label remove <id> ${FEEDBACK_LABEL}\`). Check \`bd list --label ${FEEDBACK_LABEL}\` for feedback still to address. When relaying a subagent's questions, file each one with the tool unless the subagent already did.`
 
 const SUBAGENT_GUIDANCE = `
 
@@ -49,10 +58,11 @@ If you need a decision, approval, answer, review or feedback from the human, cal
 const EXTRACT_SYSTEM = `You read a report a coding subagent handed back to its manager and list every point where it needs a HUMAN to act: a decision, an approval, a question only the human can answer, a review, or feedback. Ignore rhetorical questions, questions the report answers itself, and routine next steps the manager can decide alone. Reply with a JSON array only, no prose: [{"kind":"decision|approval|question|review|feedback","question":"one line","details":"the context, options and any recommendation, in the report's words"}]. Reply [] when there is nothing.`
 
 type Engine = EngineInterface
-type AskInput = { kind?: string; question?: string; details?: string; blocks?: string }
+type AskInput = { kind?: string; question?: string; details?: string; blocks?: string; project?: string }
 
 let bdArgv: string[] | null = null
 let seen: Set<string> | null = null
+let sessionFolder: string | undefined
 const askedBy = new Map<string, string>()
 const filedBy = new Set<string>()
 
@@ -135,12 +145,30 @@ const refresh = async ($: Engine) => {
   seen = new Set(list.map(one => one.id))
   const [first] = fresh
   if (fresh.length === 1 && first) {
-    $.ui.toast(`⚑ New ${first.kind}: ${truncate(first.title, 70)} (${first.id})`, {
+    const where = isMixed(list) ? ` in ${first.project}` : ''
+    $.ui.toast(`⚑ New ${first.kind}${where}: ${truncate(first.title, 70)} (${first.id})`, {
       timeoutMs: 8000,
     })
   } else if (fresh.length > 1) {
     $.ui.toast(`⚑ ${fresh.length} new items need you · /inbox`, { timeoutMs: 8000 })
   }
+}
+
+// The bead's own tag wins, so filing never gives a bead a second project.
+const projectFor = async ($: Engine, blocks: string | undefined, asked: string | undefined) => {
+  if (blocks) {
+    const show = await bd($, ['show', blocks, '--json'])
+    try {
+      const tagged = show.exitCode === 0 ? labelledProject(parseBead(show.stdout, blocks)?.labels ?? []) : undefined
+      if (tagged) {
+        return tagged
+      }
+    } catch {
+      // unreadable bd output: fall back to the name
+    }
+  }
+
+  return cleanProject(asked) ?? cleanProject(sessionFolder)
 }
 
 const fileGate = async (
@@ -150,10 +178,13 @@ const fileGate = async (
   details: string,
   blocks: string | undefined,
   source: string | undefined,
+  project: string | undefined,
 ): Promise<{ id: string; blocks: string; isGate: boolean } | { error: string }> => {
+  const tag = project ? [projectLabel(project)] : []
+  const labels = [`attn:${kind}`, ...tag].join(',')
   let target = blocks?.trim()
   if (!target) {
-    const q = await bd($, ['q', `Follow up: ${truncate(question, 100)}`])
+    const q = await bd($, ['q', `Follow up: ${truncate(question, 100)}`, ...tag.flatMap(one => ['--labels', one])])
     if (q.exitCode !== 0) {
       return { error: q.stderr.trim() || 'bd q failed' }
     }
@@ -172,7 +203,7 @@ const fileGate = async (
     if (c.exitCode !== 0) {
       return { error: c.stderr.trim() || 'bd comments add failed' }
     }
-    await bd($, ['label', 'add', target, `attn:${kind}`])
+    await bd($, ['label', 'add', target, labels])
 
     return { id: target, blocks: target, isGate: false }
   }
@@ -192,7 +223,7 @@ const fileGate = async (
   if (!id) {
     return { error: `the gate may have been created, but bd printed no id (check /inbox before retrying): ${truncate(created.stdout.trim(), 200)}` }
   }
-  await bd($, ['label', 'add', id, `attn:${kind}`])
+  await bd($, ['label', 'add', id, labels])
 
   return { id, blocks: target, isGate: true }
 }
@@ -342,6 +373,7 @@ const fillPrompt = ($: Engine, text: string) => $.prompt.fill({ text, mode: 'rep
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    sessionFolder = folderName(e.cwd)
     await $.tool.register({
       name: TOOL,
       description:
@@ -358,6 +390,10 @@ export const register: Register = on => {
           blocks: {
             type: 'string',
             description: 'The bead id this question holds up, if any; otherwise a follow-up bead is made',
+          },
+          project: {
+            type: 'string',
+            description: "The project this concerns, shown as a tag in the inbox. Defaults to the session's folder name; a project already on the `blocks` bead takes precedence",
           },
         },
         required: ['kind', 'question'],
@@ -409,13 +445,13 @@ export const register: Register = on => {
     const source = input.agentId ? (askedBy.get(input.agentId) ?? 'a subagent') : 'manager'
     const kind = isKind(input.kind) ? input.kind : 'question'
     const blocks = input.blocks?.trim() || undefined
+    const project = await projectFor($, blocks, input.project)
 
     // A retry of a call that filed but failed to answer must not file again.
     await refresh($)
     const existing = (await read($, items)).find(
       one =>
-        sameQuestion(one.title, question) ||
-        sameQuestion(one.title, `Follow up: ${truncate(question, 100)}`) ||
+        isRepeat(one, question, project) ||
         (isFeedbackKind(kind) && blocks !== undefined && one.id === blocks && one.kind === kind),
     )
     if (existing) {
@@ -424,7 +460,7 @@ export const register: Register = on => {
       }
     }
 
-    const filed = await fileGate($, kind, question, input.details ?? '', blocks, source)
+    const filed = await fileGate($, kind, question, input.details ?? '', blocks, source, project)
     if ('error' in filed) {
       return { deny: `Could not file the question: ${filed.error}` }
     }
@@ -467,8 +503,9 @@ export const register: Register = on => {
           return
         }
         const source = `${askedBy.get(agentId) ?? 'a subagent'} (auto-extracted)`
+        const project = await projectFor($, undefined, undefined)
         for (const one of parseExtracted(r.text)) {
-          await fileGate($, one.kind, one.question, one.details, undefined, source)
+          await fileGate($, one.kind, one.question, one.details, undefined, source, project)
         }
         void refresh($)
       })()
@@ -509,7 +546,10 @@ export const register: Register = on => {
         </Box>
       )
     }
-    const item = (await read($, items)).find(one => one.id === view.id)
+    const list = await read($, items)
+    const item = list.find(one => one.id === view.id)
+    const project = isMixed(list) ? (item?.project ?? projectOf(view.id, view.labels)) : undefined
+    const colorOf = projectColors(list.map(one => one.project))
     const meta = [
       view.type,
       view.status,
@@ -521,6 +561,12 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Text bold wrap="wrap">
+          {project ? (
+            <Text color={CHIP_TEXT} backgroundColor={colorOf(project)}>
+              {chipText(project)}
+            </Text>
+          ) : null}
+          {project ? ' ' : ''}
           {view.title} <Text dimColor>{view.id}</Text>
         </Text>
         <Text dimColor wrap="wrap">
@@ -670,12 +716,21 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const at = await read($, now)
     const more = list.length - BAND_ROWS
+    const mixed = isMixed(list)
+    const colorOf = projectColors(list.map(one => one.project))
 
     return (
       <Box flexDirection="column">
         {list.slice(0, BAND_ROWS).map(item => (
           <Text wrap="truncate-end">
-            <Text color={COLOR[item.kind]}>⚑ [{TAG[item.kind]}]</Text> {item.title}{' '}
+            <Text color={COLOR[item.kind]}>⚑ [{TAG[item.kind]}]</Text>{' '}
+            {mixed ? (
+              <Text color={CHIP_TEXT} backgroundColor={colorOf(item.project)}>
+                {chipText(item.project)}
+              </Text>
+            ) : null}
+            {mixed ? ' ' : ''}
+            {item.title}{' '}
             <Text dimColor>
               {item.id} · {age(item.createdAt, at)}
             </Text>
@@ -702,6 +757,8 @@ export const register: Register = on => {
       return <Text dimColor>Nothing needs you. Gates filed by agents show here.</Text>
     }
 
+    const mixed = isMixed(list)
+    const colorOf = projectColors(list.map(one => one.project))
     const rows: RenderChildren[] = []
     let used = 0
     for (const kind of KINDS) {
@@ -722,6 +779,12 @@ export const register: Register = on => {
         rows.push(
           <Box key={item.id} flexDirection="column" marginBottom={1}>
             <Text wrap="wrap">
+              {mixed ? (
+                <Text color={CHIP_TEXT} backgroundColor={colorOf(item.project)}>
+                  {chipText(item.project)}
+                </Text>
+              ) : null}
+              {mixed ? ' ' : ''}
               <Text bold>{item.title}</Text>{' '}
               <Text dimColor>
                 {item.id}

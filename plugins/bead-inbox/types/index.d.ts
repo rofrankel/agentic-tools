@@ -9,6 +9,7 @@ export type AttnItem = {
   createdAt: string
   isGate: boolean
   label?: string
+  project: string
 }
 
 export type BeadRef = { id: string; title: string; status: string; type: string }

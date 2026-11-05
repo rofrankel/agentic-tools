@@ -8,7 +8,7 @@ A long-running manager session with many subagents keeps asking questions. Each 
 
 - A Claude Code build that loads plugin hook modules (`hooks/hooks.json` with `"modules"`)
 - [`bd`](https://github.com/steveyegge/beads) on your PATH, or installed with npm (the plugin finds the real `bd.exe` behind npm's Windows shim)
-- Claude Code started in a repo with a beads database (`.beads/`), or `BEADS_DIR` set. There is one inbox per repo.
+- Claude Code started in a repo with a beads database (`.beads/`), or `BEADS_DIR` set. There is one inbox per database, so projects that share a database share an inbox.
 
 ## Install
 
@@ -26,6 +26,12 @@ A long-running manager session with many subagents keeps asking questions. Each 
 - **Bead pane** (Open, or `/inbox-open <id>`): the full bead, its comments, and what it blocks
 
 It reads `bd` every 15 seconds, and also after any `bd` command or subagent return.
+
+### Projects
+
+When the inbox holds more than one project, the band, the `/inbox` pane and the bead pane show a colored tag with the project's name, and toasts name the project. The color comes from the name, so a project usually keeps it across sessions; if two projects in the inbox would match, one takes the next free color. With a single project the tags stay hidden.
+
+A bead's project is its `project:<name>` label, or its id prefix if it has none. To tag a bead by hand: `bd label add <id> project:<name>`.
 
 ## Commands
 
@@ -46,14 +52,15 @@ The plugin registers an `ask_human` tool and tells the manager and every subagen
 
 - **Decision, approval or question:** creates a beads human gate labelled `attn:<kind>`. The gate blocks the bead in question, or a new "Follow up: ..." bead if none is given. The agent moves on to other ready work.
 - **Review or feedback:** blocks nothing. The work bead itself is labelled `attn:review` or `attn:feedback`, with the request added as a comment.
-- **Retries:** a repeated question is matched to the item already filed, so it isn't filed twice.
+- **Project:** each item is labelled `project:<name>`: the project of the bead it concerns if that bead has one, else the `project` the agent passed, else the name of the session's folder.
+- **Retries:** a repeated question from the same project is matched to the item already filed, so it isn't filed twice.
 - **Backup:** when a subagent finishes with questions written in prose, Haiku extracts them and files them, marked "(auto-extracted)". A report that says `User questions: none` is skipped.
 
 Anything else with an `attn:*` label, or any open human gate, shows up too, so you can file items by hand:
 
 ```
 bd gate create --type human --blocks <id> --title "<question>" --reason "<details>"
-bd label add <gate-id> attn:decision
+bd label add <gate-id> attn:decision,project:<name>
 ```
 
 ## What answering does
