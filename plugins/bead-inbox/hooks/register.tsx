@@ -748,7 +748,13 @@ export const register: Register = on => {
     if (!beadId) {
       return { text: 'Usage: /inbox-show <bead-id>' }
     }
-    const item = (await read($, items)).find(one => one.id === beadId)
+    const find = async () => (await read($, items)).find(one => one.id === beadId)
+    // Just after a reload the list can be empty until the next poll.
+    let item = await find()
+    if (!item) {
+      await refresh($)
+      item = await find()
+    }
     const view = await loadBead($, beadId, item?.blocks)
     const how = item?.kind === 'approval' ? `/approve ${beadId} [note] or /reject ${beadId} <reason>` : `/answer ${beadId} <text>`
 
