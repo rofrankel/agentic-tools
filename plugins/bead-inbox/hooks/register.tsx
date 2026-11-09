@@ -9,7 +9,11 @@ import {
   KINDS,
   TAG,
   age,
+  beadText,
   chipText,
+  filterItems,
+  listText,
+  searchItems,
   cleanProject,
   folderName,
   isFeedbackKind,
@@ -41,6 +45,7 @@ const TOOL_ID = 'mcp__bead-inbox__ask_human'
 const FEEDBACK_LABEL = 'human-feedback'
 const POLL_MS = 15_000
 const BAND_ROWS = 3
+const DISMISSED = 'Dismissed by the human without an answer; use your judgment.'
 
 const items = atom({ plugin: 'bead-inbox', key: 'items' } as const, [])
 const error = atom({ plugin: 'bead-inbox', key: 'error' } as const, null)
@@ -327,9 +332,15 @@ const openBead = async ($: Engine, beadId: string) => {
     await update($, views, all => (all[paneId] ? all : { ...all, [paneId]: previewOf(item) }))
   }
   void $.ui.open({ id: paneId, title: beadId })
+  const shown = await loadBead($, beadId, item?.blocks)
+  await update($, views, all => ({ ...all, [paneId]: shown }))
+  await update($, loading, ids => ids.filter(one => one !== paneId))
+}
+
+// The bead's full record, its comments and, for a gate, the bead it blocks.
+const loadBead = async ($: Engine, beadId: string, blocksId: string | undefined): Promise<BeadView> => {
   // One bd run for the bead, its comments and the bead it blocks: each run
   // costs about a second, more while the poll or an agent holds the database.
-  const blocksId = item?.blocks
   const show = await bd($, ['show', beadId, ...(blocksId ? [blocksId] : []), '--include-comments', '--json'])
   let view: BeadView | undefined
   if (show.exitCode === 0) {
@@ -345,13 +356,27 @@ const openBead = async ($: Engine, beadId: string) => {
       view = undefined
     }
   }
-  const shown: BeadView = view ?? {
+  return view ?? {
     id: beadId, title: '', status: '', type: '', priority: null, labels: [], createdAt: '', updatedAt: '',
     sections: [], deps: [], comments: [],
     error: show.exitCode === 0 ? 'could not read bd output' : truncate(show.stderr.trim() || `bd show ${beadId} failed`, 300),
   }
-  await update($, views, all => ({ ...all, [paneId]: shown }))
-  await update($, loading, ids => ids.filter(one => one !== paneId))
+}
+
+// What the list commands reply: bd's error, an empty note, or the items.
+const replyWith = async ($: Engine, list: AttnItem[] | undefined, empty: string, details: boolean) => {
+  const failure = await read($, error)
+  if (failure) {
+    return { text: failure }
+  }
+  if (!list || list.length === 0) {
+    return { text: empty }
+  }
+  const all = await read($, items)
+
+  return {
+    text: listText(list, await read($, now), { details, projects: isMixed(all) }),
+  }
 }
 
 const previewOf = (item: AttnItem): BeadView => ({
@@ -401,9 +426,13 @@ export const register: Register = on => {
     })
     for (const command of [
       { name: 'inbox', description: 'Show beads that need your attention' },
+      { name: 'inbox-list', description: 'List the inbox as text, with details', argumentHint: '[kind|project]' },
+      { name: 'inbox-search', description: 'Find inbox items holding every word', argumentHint: '<words>' },
+      { name: 'inbox-show', description: 'Show a bead as text: details, comments, what it blocks', argumentHint: '<bead-id>' },
       { name: 'answer', description: 'Answer a human gate', argumentHint: '<gate-id> <answer>' },
       { name: 'approve', description: 'Approve a human gate', argumentHint: '<gate-id> [note]' },
       { name: 'reject', description: 'Reject a human gate', argumentHint: '<gate-id> <reason>' },
+      { name: 'inbox-dismiss', description: 'Dismiss an item without an answer', argumentHint: '<id>' },
       { name: 'inbox-help', description: 'How to use the bead-inbox plugin' },
       { name: 'inbox-open', description: 'Open a bead in its own pane', argumentHint: '<bead-id>' },
     ]) {
@@ -648,11 +677,13 @@ export const register: Register = on => {
     )
   })
 
+  // The commands section as text too: a remote client may not show the pane.
   on('command.run', { command: 'inbox-help' }, async $ => {
-    await $.ui.open({ id: HELP_PANE, title: 'Inbox help' })
+    await $.ui.open({ id: HELP_PANE, title: 'Inbox help' }).catch(() => undefined)
+    const commands = HELP.find(([heading]) => heading === 'Commands')?.[1] ?? []
 
-    return { text: 'Inbox help opened.' }
-  })
+    return { text: ['Inbox help opened. Commands:', ...commands].join('\n') }
+  }).catch(failed)
 
   on('ui.render', { component: 'Pane', requestId: HELP_PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
@@ -673,13 +704,65 @@ export const register: Register = on => {
     )
   })
 
+  // Each list command replies in text as well, so it reads the same over
+  // Remote Control, where the band and the pane may not show.
   on('command.run', { command: 'inbox' }, async $ => {
     await refresh($)
-    await $.ui.open({ id: PANE, title: 'Needs you' })
-    const count = (await read($, items)).length
+    // Where nothing draws a pane the reply below still answers.
+    await $.ui.open({ id: PANE, title: 'Needs you' }).catch(() => undefined)
+    const list = await read($, items)
+    const reply = await replyWith($, list, 'Nothing needs you.', false)
+    if (list.length === 0) {
+      return reply
+    }
 
-    return { text: count === 0 ? 'Nothing needs you.' : `${count} item${count === 1 ? '' : 's'} need you.` }
-  })
+    return { text: `${list.length} item${list.length === 1 ? ' needs' : 's need'} you:\n\n${reply.text}` }
+  }).catch(failed)
+
+  on('command.run', { command: 'inbox-list' }, async ($, e) => {
+    await refresh($)
+    const list = await read($, items)
+    const filter = e.args.trim()
+    const narrowed = filterItems(list, filter)
+    if (!narrowed && list.length > 0) {
+      const projects = [...new Set(list.map(one => one.project))].join(', ')
+
+      return { text: `"${filter}" is neither a kind (${KINDS.map(kind => TAG[kind]).join(', ')}) nor a project in the inbox (${projects}).` }
+    }
+
+    return replyWith($, narrowed, filter ? `Nothing in the inbox for "${filter}".` : 'Nothing needs you.', true)
+  }).catch(failed)
+
+  on('command.run', { command: 'inbox-search' }, async ($, e) => {
+    const query = e.args.trim()
+    if (!query) {
+      return { text: 'Usage: /inbox-search <words>' }
+    }
+    await refresh($)
+
+    return replyWith($, searchItems(await read($, items), query), `No inbox item matches "${query}".`, true)
+  }).catch(failed)
+
+  on('command.run', { command: 'inbox-show' }, async ($, e) => {
+    const beadId = e.args.trim().split(/\s+/)[0]
+    if (!beadId) {
+      return { text: 'Usage: /inbox-show <bead-id>' }
+    }
+    const item = (await read($, items)).find(one => one.id === beadId)
+    const view = await loadBead($, beadId, item?.blocks)
+    const how = item?.kind === 'approval' ? `/approve ${beadId} [note] or /reject ${beadId} <reason>` : `/answer ${beadId} <text>`
+
+    return { text: item && !view.error ? `${beadText(view)}\n\nReply: ${how}` : beadText(view) }
+  }).catch(failed)
+
+  on('command.run', { command: 'inbox-dismiss' }, async ($, e) => {
+    const beadId = e.args.trim().split(/\s+/)[0]
+    if (!beadId) {
+      return { text: 'Usage: /inbox-dismiss <id>' }
+    }
+
+    return resolve($, beadId, DISMISSED)
+  }).catch(failed)
 
   on('command.run', { command: 'answer' }, async ($, e) => {
     const parsed = splitIdAndText(e.args)
@@ -810,7 +893,7 @@ export const register: Register = on => {
                 key={`${item.id}:dismiss`}
                 label="Dismiss"
                 dimColor
-                onPress={() => resolve($, item.id, 'Dismissed by the human without an answer; use your judgment.')}
+                onPress={() => resolve($, item.id, DISMISSED)}
               />
             </Box>
           </Box>,

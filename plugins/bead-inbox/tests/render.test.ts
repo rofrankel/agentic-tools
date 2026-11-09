@@ -79,7 +79,7 @@ test('the same question from a second project is filed, from the same project is
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false } }
 const PANE = { component: 'Pane', requestId: 'bead-inbox', props: {} }
 
-for (const surface of ['terminal', 'desktop'] as const) {
+for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
   test(`a mixed inbox tags each row with its project on ${surface}`, async ($, on) => {
     fakeBd(on as never, [bead('p-1', 'First?', ['project:api']), bead('p-2', 'Second?', ['project:web'])])
     await $.tool.call(ask({ question: 'First?', project: 'api' }))

@@ -181,6 +181,102 @@ export const age = (createdAt: string, now: number): string => {
   return `${Math.round(minutes / 1440)}d`
 }
 
+// A kind by its name or its tag: "approval" and "approve" are the same list.
+export const kindNamed = (word: string): AttnKind | undefined => {
+  const lower = word.trim().toLowerCase()
+
+  return KINDS.find(kind => kind === lower || TAG[kind] === lower || `${kind}s` === lower)
+}
+
+// "/inbox-list decide", "/inbox-list api", "/inbox-list project:api": a kind
+// or a project narrows the list; undefined when the word names neither.
+export const filterItems = (list: AttnItem[], filter: string): AttnItem[] | undefined => {
+  const word = filter.trim()
+  if (word === '') {
+    return list
+  }
+  const kind = kindNamed(word)
+  if (kind) {
+    return list.filter(one => one.kind === kind)
+  }
+  const project = cleanProject(word)
+
+  return list.some(one => one.project === project) ? list.filter(one => one.project === project) : undefined
+}
+
+// Every word of the query, in any case, somewhere in the item.
+export const searchItems = (list: AttnItem[], query: string): AttnItem[] => {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+
+  return list.filter(one => {
+    const haystack = [one.id, one.title, one.details, one.project, one.kind, TAG[one.kind], one.blocks ?? '']
+      .join(' ')
+      .toLowerCase()
+
+    return words.every(word => haystack.includes(word))
+  })
+}
+
+// The inbox as plain text, for a command's reply: a remote client shows the
+// transcript, not the band or the pane.
+export const listText = (list: AttnItem[], now: number, options: { details?: boolean; projects?: boolean } = {}): string => {
+  const withProject = options.projects ?? isMixed(list)
+  const lines: string[] = []
+  for (const kind of KINDS) {
+    const group = list.filter(one => one.kind === kind)
+    if (group.length === 0) {
+      continue
+    }
+    lines.push(`${lines.length > 0 ? '\n' : ''}${TAG[kind].toUpperCase()} (${group.length})`)
+    for (const item of group) {
+      const where = withProject ? `[${item.project}] ` : ''
+      const blocks = item.blocks ? ` → ${item.blocks}` : ''
+      lines.push(`  ${item.id}  ${where}${item.title}${blocks} · ${age(item.createdAt, now)}`)
+      if (options.details && item.details) {
+        lines.push(...truncate(item.details, 600).split(/\r?\n/).map(line => `      ${line}`))
+      }
+    }
+  }
+
+  return lines.join('\n')
+}
+
+// Room for a long bead in one transcript row on every surface.
+const BEAD_TEXT_MAX = 8000
+
+// The bead pane's content as plain text: /inbox-show over Remote Control.
+export const beadText = (view: BeadView): string => {
+  if (view.error) {
+    return `${view.id}: ${view.error}`
+  }
+  const meta = [
+    view.type,
+    view.status,
+    view.priority === null ? '' : `P${view.priority}`,
+    view.assignee ? `@${view.assignee}` : '',
+    view.labels.length > 0 ? view.labels.join(', ') : '',
+  ].filter(Boolean)
+  const lines = [`${view.title} (${view.id})`, meta.join(' · '), `created ${view.createdAt} · updated ${view.updatedAt}`]
+  for (const section of view.sections) {
+    lines.push('', `${section.heading}:`, section.text)
+  }
+  if (view.blocks) {
+    lines.push('', `Blocks: ${view.blocks.id} ${view.blocks.title} (${view.blocks.type}, ${view.blocks.status})`)
+    if (view.blocks.description) {
+      lines.push(truncate(view.blocks.description, 1500))
+    }
+  }
+  if (view.deps.length > 0) {
+    lines.push('', `Depends on (${view.deps.length}):`, ...view.deps.map(dep => `  ${dep.id} ${dep.title} (${dep.type}, ${dep.status})`))
+  }
+  lines.push('', `Comments (${view.comments.length}):`)
+  for (const comment of view.comments) {
+    lines.push(`  ${comment.author} · ${comment.createdAt}`, ...comment.text.split(/\r?\n/).map(line => `    ${line}`))
+  }
+
+  return truncate(lines.join('\n'), BEAD_TEXT_MAX)
+}
+
 // "/answer bd-12 use postgres" → { id: "bd-12", text: "use postgres" }
 export const splitIdAndText = (args: string): { id: string; text: string } | undefined => {
   const match = /^\s*(\S+)\s*([\s\S]*)$/.exec(args)
@@ -249,12 +345,17 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
     'Commands',
     [
       '/inbox                       open the full list (grouped by kind, with details and buttons)',
+      '/inbox-list [kind|project]   the list as text, with details; narrowed to a kind (approve, decide…) or a project',
+      '/inbox-search <words>        items whose id, title, details or project hold every word',
+      '/inbox-show <id>             a bead as text: details, comments, what it blocks',
       '/answer <id> <text>          answer an item',
       '/approve <id> [note]         approve (answer "APPROVED")',
       '/reject <id> <reason>        reject (answer "REJECTED: ...")',
+      '/inbox-dismiss <id>          dismiss without an answer (the agent uses its judgment)',
       '/inbox-open <id>             open a bead in its own pane (full details, comments, what it blocks)',
       '/inbox-help                  this help',
-      'These run at once, even mid-turn. In the pane: Open (the bead in its own pane), Approve, Answer… / Reject… (fills the prompt), Dismiss (agent uses its judgment).',
+      'These run at once, even mid-turn, and cost no model tokens. In the pane: Open (the bead in its own pane), Approve, Answer… / Reject… (fills the prompt), Dismiss (agent uses its judgment).',
+      'Over Remote Control (/rc) the status line, band and panes may not show: /inbox, /inbox-list, /inbox-search and /inbox-show reply in the transcript, and answering works the same.',
     ],
   ],
   [

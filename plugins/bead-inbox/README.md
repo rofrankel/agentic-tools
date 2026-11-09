@@ -37,14 +37,22 @@ A bead's project is its `project:<name>` label, or its id prefix if it has none.
 
 | Command | Does |
 | --- | --- |
-| `/inbox` | Open the full list |
+| `/inbox` | Open the full list, and print it |
+| `/inbox-list [kind\|project]` | Print the list with details, optionally just one kind (`approve`, `decide`, `answer`, `review`, `feedback`) or one project |
+| `/inbox-search <words>` | Print the items whose id, title, details or project contain every word |
+| `/inbox-show <id>` | Print a bead: details, comments, and what it blocks |
 | `/answer <id> <text>` | Answer an item |
 | `/approve <id> [note]` | Approve (answers `APPROVED`) |
 | `/reject <id> <reason>` | Reject (answers `REJECTED: ...`) |
+| `/inbox-dismiss <id>` | Dismiss without an answer (the agent uses its judgment) |
 | `/inbox-open <id>` | Open a bead in its own pane |
 | `/inbox-help` | Usage help |
 
-All of them run immediately, even while the agent is mid-turn.
+All of them run immediately, even while the agent is mid-turn, and none uses model tokens.
+
+### Remote Control
+
+Commands sent from claude.ai or the mobile app through Remote Control (`/rc`) run in your local session like typed ones. The status line, band and panes may not show on the remote client, so do the whole loop with text commands: `/inbox` or `/inbox-list` to see what's waiting, `/inbox-show <id>` for one item, then `/answer`, `/approve`, `/reject` or `/inbox-dismiss`. Their replies show in the transcript.
 
 ## How items get filed
 
