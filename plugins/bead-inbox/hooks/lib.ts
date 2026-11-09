@@ -277,6 +277,23 @@ export const beadText = (view: BeadView): string => {
   return truncate(lines.join('\n'), BEAD_TEXT_MAX)
 }
 
+// "u1y" stands for "ait-u1y": the prefix may be left out when one item's id
+// ends that way. With none the id goes to bd as typed, which reads short ids
+// too; with several the person has to say which.
+export const matchId = (list: AttnItem[], typed: string): { id: string } | { ambiguous: string[] } => {
+  const lower = typed.trim().toLowerCase()
+  const exact = list.find(one => one.id.toLowerCase() === lower)
+  if (exact) {
+    return { id: exact.id }
+  }
+  const ends = list.filter(one => one.id.toLowerCase().endsWith(`-${lower}`))
+  if (ends.length > 1) {
+    return { ambiguous: ends.map(one => one.id) }
+  }
+
+  return { id: ends[0]?.id ?? typed.trim() }
+}
+
 // "/answer bd-12 use postgres" → { id: "bd-12", text: "use postgres" }
 export const splitIdAndText = (args: string): { id: string; text: string } | undefined => {
   const match = /^\s*(\S+)\s*([\s\S]*)$/.exec(args)
@@ -354,6 +371,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
       '/inbox-dismiss <id>          dismiss without an answer (the agent uses its judgment)',
       '/inbox-open <id>             open a bead in its own pane (full details, comments, what it blocks)',
       '/inbox-help                  this help',
+      'An id may leave out its prefix (u1y for ait-u1y) when only one item in the inbox ends that way.',
       'These run at once, even mid-turn, and cost no model tokens. In the pane: Open (the bead in its own pane), Approve, Answer… / Reject… (fills the prompt), Dismiss (agent uses its judgment).',
       'Over Remote Control (/rc) the status line, band and panes may not show: /inbox, /inbox-list, /inbox-search and /inbox-show reply in the transcript, and answering works the same.',
     ],

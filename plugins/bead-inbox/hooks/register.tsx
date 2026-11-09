@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { CommandRunResult, EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { AttnItem, AttnKind, BeadView } from '../types'
 import {
@@ -13,6 +13,7 @@ import {
   chipText,
   filterItems,
   listText,
+  matchId,
   searchItems,
   cleanProject,
   folderName,
@@ -321,6 +322,23 @@ const resolve = async ($: Engine, id: string, answer: string) => {
 
 const failed = () => ({ text: 'bead-inbox: the command failed; see the debug log.' })
 
+// Runs `act` on the full id of what the person typed ("u1y" for "ait-u1y").
+// Just after a reload the list is empty until the next poll, so a miss
+// refreshes it once before the id goes to bd as typed.
+const withId = async ($: Engine, typed: string, act: (id: string) => Promise<CommandRunResult>) => {
+  const inList = (id: string) => read($, items).then(list => list.some(one => one.id === id))
+  let match = matchId(await read($, items), typed)
+  if ('id' in match && !(await inList(match.id))) {
+    await refresh($)
+    match = matchId(await read($, items), typed)
+  }
+  if ('ambiguous' in match) {
+    return { text: `"${typed}" could be ${match.ambiguous.join(' or ')}: give the full id.` }
+  }
+
+  return act(match.id)
+}
+
 // Opens the bead in a pane of its own (one per bead), then loads its full
 // record, its comments and, for a gate, the bead it blocks.
 const openBead = async ($: Engine, beadId: string) => {
@@ -548,9 +566,12 @@ export const register: Register = on => {
     if (!beadId) {
       return { text: 'Usage: /inbox-open <bead-id>' }
     }
-    await openBead($, beadId)
 
-    return { text: `Opened ${beadId}.` }
+    return withId($, beadId, async id => {
+      await openBead($, id)
+
+      return { text: `Opened ${id}.` }
+    })
   }).catch(failed)
 
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {
@@ -748,17 +769,14 @@ export const register: Register = on => {
     if (!beadId) {
       return { text: 'Usage: /inbox-show <bead-id>' }
     }
-    const find = async () => (await read($, items)).find(one => one.id === beadId)
-    // Just after a reload the list can be empty until the next poll.
-    let item = await find()
-    if (!item) {
-      await refresh($)
-      item = await find()
-    }
-    const view = await loadBead($, beadId, item?.blocks)
-    const how = item?.kind === 'approval' ? `/approve ${beadId} [note] or /reject ${beadId} <reason>` : `/answer ${beadId} <text>`
 
-    return { text: item && !view.error ? `${beadText(view)}\n\nReply: ${how}` : beadText(view) }
+    return withId($, beadId, async id => {
+      const item = (await read($, items)).find(one => one.id === id)
+      const view = await loadBead($, id, item?.blocks)
+      const how = item?.kind === 'approval' ? `/approve ${id} [note] or /reject ${id} <reason>` : `/answer ${id} <text>`
+
+      return { text: item && !view.error ? `${beadText(view)}\n\nReply: ${how}` : beadText(view) }
+    })
   }).catch(failed)
 
   on('command.run', { command: 'inbox-dismiss' }, async ($, e) => {
@@ -767,7 +785,7 @@ export const register: Register = on => {
       return { text: 'Usage: /inbox-dismiss <id>' }
     }
 
-    return resolve($, beadId, DISMISSED)
+    return withId($, beadId, id => resolve($, id, DISMISSED))
   }).catch(failed)
 
   on('command.run', { command: 'answer' }, async ($, e) => {
@@ -776,7 +794,7 @@ export const register: Register = on => {
       return { text: 'Usage: /answer <gate-id> <answer>' }
     }
 
-    return resolve($, parsed.id, parsed.text)
+    return withId($, parsed.id, id => resolve($, id, parsed.text))
   }).catch(failed)
 
   on('command.run', { command: 'approve' }, async ($, e) => {
@@ -785,7 +803,7 @@ export const register: Register = on => {
       return { text: 'Usage: /approve <gate-id> [note]' }
     }
 
-    return resolve($, parsed.id, parsed.text ? `APPROVED. ${parsed.text}` : 'APPROVED')
+    return withId($, parsed.id, id => resolve($, id, parsed.text ? `APPROVED. ${parsed.text}` : 'APPROVED'))
   }).catch(failed)
 
   on('command.run', { command: 'reject' }, async ($, e) => {
@@ -794,7 +812,7 @@ export const register: Register = on => {
       return { text: 'Usage: /reject <gate-id> <reason>' }
     }
 
-    return resolve($, parsed.id, `REJECTED: ${parsed.text}`)
+    return withId($, parsed.id, id => resolve($, id, `REJECTED: ${parsed.text}`))
   }).catch(failed)
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

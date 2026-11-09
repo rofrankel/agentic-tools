@@ -48,7 +48,7 @@ A bead's project is its `project:<name>` label, or its id prefix if it has none.
 | `/inbox-open <id>` | Open a bead in its own pane |
 | `/inbox-help` | Usage help |
 
-All of them run immediately, even while the agent is mid-turn, and none uses model tokens.
+All of them run immediately, even while the agent is mid-turn, and none uses model tokens. An id can leave out its prefix (`/approve u1y` for `ait-u1y`) when only one item in the inbox ends that way.
 
 ### Remote Control
 

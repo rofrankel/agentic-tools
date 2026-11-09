@@ -99,6 +99,19 @@ test('/inbox-show prints the bead, what it blocks, its comments and how to reply
   expect(text).toContain('/approve api-1')
 })
 
+test('an id works without its prefix', async ($, on) => {
+  const calls = fakeBd(on as never)
+
+  expect(await run($ as never, 'inbox-show', '1')).toContain('could be api-1 or web-1')
+
+  const text = await run($ as never, 'inbox-show', '2')
+  expect(text).toContain('/answer api-2')
+
+  await run($ as never, 'approve', '2 looks good')
+  expect(calls.find(one => one[0] === 'gate' && one[1] === 'resolve')?.slice(0, 3)).toEqual(['gate', 'resolve', 'api-2'])
+  await settled()
+})
+
 test('/inbox-dismiss resolves the gate for the agent to judge', async ($, on) => {
   const calls = fakeBd(on as never)
   await run($ as never, 'inbox')
