@@ -41,6 +41,8 @@ declare module 'claude-code' {
       now: number
       views: Record<string, BeadView>
       loading: string[]
+      filter: { kind?: AttnKind; project?: string }
+      notSaved: Record<string, string>
     }
   }
 }

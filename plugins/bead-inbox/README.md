@@ -22,10 +22,16 @@ A long-running manager session with many subagents keeps asking questions. Each 
 - **Status line:** a count by kind, e.g. `⚑ 3 need you · 1 approve · 2 decide`
 - **Band above the prompt:** the top 3 items, approvals first, then oldest
 - **Toast** when a new item arrives
-- **`/inbox` pane:** everything, grouped by kind, with details and buttons (Open, Approve, Answer…, Reject…, Dismiss)
-- **Bead pane** (Open, or `/inbox-open <id>`): the full bead, its comments, and what it blocks
+- **`/inbox` pane:** everything, grouped by kind, with details and buttons (Open, Approve, Answer…, Reject…, Dismiss). It scrolls, so nothing is cut off. `/inbox [kind] [project:<name>]` filters it (a project includes its subprojects: `project:web` holds `web:api`, not `webapp`); in a mixed inbox each row's project tag is a button that filters to that project, and the filter bar's Clear shows everything again. Bare `/inbox` clears the filter.
+- **Bead pane** (Open, or `/inbox-open <id>`): the full bead, its comments, and what it blocks. Markdown links (`[text](url)`) in descriptions and comments are drawn as links.
 
-It reads `bd` every 15 seconds, and also after any `bd` command or subagent return.
+Only an interactive session polls; background agents and `claude -p` runs read `bd` only when a command or `ask_human` runs, so they don't add to lock contention. Each poll first takes a cheap signature of the beads store (for Dolt, each database's journal size and a hash of its manifest: file metadata and one small read, no `bd` process) and reads `bd` only when it changed, or once the list is a minute old. That lets the poll run every 10 seconds at almost no cost. A store it doesn't recognise falls back to reading `bd` every 60 seconds. It also reads after any `bd` command or subagent return, and at once after your answer.
+
+### Answering is instant
+
+An answered item leaves the band, status line and pane at once, before `bd` has written anything (a write can wait minutes on the database lock during a `bd dolt push`). A poll whose reads began before your answer can't bring it back. If the write fails, the item comes back where it was, marked **Not saved: <reason>**. Answering again redoes only what's missing: if your comment saved but the `attn:` label wouldn't come off, the retry only removes the label.
+
+`bd` gets 120 seconds and one retry on a database-lock error (or on a timeout, except for commands that create something, which could land twice). An answer resubmitted within 2 minutes isn't saved twice, and the reply says so. A partial success says what failed. Pane buttons toast "saving…" and then the result.
 
 ### Projects
 
@@ -37,7 +43,7 @@ A bead's project is its `project:<name>` label, or its id prefix if it has none.
 
 | Command | Does |
 | --- | --- |
-| `/inbox` | Open the full list, and print it |
+| `/inbox [kind] [project:<name>]` | Open the full list, optionally filtered, and print it |
 | `/inbox-list [kind\|project]` | Print the list with details, optionally just one kind (`approve`, `decide`, `answer`, `review`, `feedback`) or one project |
 | `/inbox-search <words>` | Print the items whose id, title, details or project contain every word |
 | `/inbox-show <id>` | Print a bead: details, comments, and what it blocks |
@@ -62,7 +68,7 @@ The plugin registers an `ask_human` tool and tells the manager and every subagen
 - **Review or feedback:** blocks nothing. The work bead itself is labelled `attn:review` or `attn:feedback`, with the request added as a comment.
 - **Project:** each item is labelled `project:<name>`: the project of the bead it concerns if that bead has one, else the `project` the agent passed, else the name of the session's folder.
 - **Retries:** a repeated question from the same project is matched to the item already filed, so it isn't filed twice.
-- **Backup:** when a subagent finishes with questions written in prose, Haiku extracts them and files them, marked "(auto-extracted)". A report that says `User questions: none` is skipped.
+- **Backup:** when a subagent finishes with questions written in prose, a model (Sonnet by default) extracts them and files them, marked "(auto-extracted)". A report that says `User questions: none` is skipped. If your agents file their own questions with `ask_human`, turn the backup off in `/config` to avoid duplicates.
 
 Anything else with an `attn:*` label, or any open human gate, shows up too, so you can file items by hand:
 
@@ -78,6 +84,22 @@ bd label add <gate-id> attn:decision,project:<name>
 - **Other labelled issue:** adds your answer as a comment and removes the `attn:` label.
 
 The manager also receives one hidden line naming your answer, so it can act without asking you.
+
+Comment text (answers, notes) goes to `bd` on standard input, and the plugin prefers the real `bd.exe` over npm's `bd.cmd` shim, so a multi-line answer arrives whole. A gate's close reason is still a command-line argument (`bd gate resolve` reads it from no file): on an install with only the shim, a multi-line reason is cut at its first line, though the full answer still lands in the comment on the blocked bead.
+
+## Settings
+
+Set these in `/config`. Each defaults to the behaviour described above.
+
+| Setting | Default | Does |
+| --- | --- | --- |
+| Extractor model | `sonnet` | The model the backup uses (`haiku`, `sonnet` or `opus`) |
+| Auto-extract questions from subagent reports | on | Turn off when your agents file their own questions |
+| Poll interval (seconds) | 0 (auto) | Auto: 10s with a store signature, 15s with a snapshot command, else 60s |
+| Read bd only when the beads store changed | on | The store-signature check before each poll |
+| Snapshot command | empty | A command that prints `{"gates": [...], "attn": [...], "error"?: "...", "started"?: <epoch seconds>}` in place of the plugin's two `bd list` calls, for setups where several sessions share one database and a cheaper shared reader exists. `gates` is what `bd list --type gate --status open --json --limit 0` prints, `attn` the `attn:*`-labelled list, `started` when the reads behind it began. Writes still go through `bd` |
+| Snapshot force arguments | empty | Added to the snapshot command after the plugin's own writes, so the reader skips its cache |
+| On-answered command | empty | Run after every saved answer (not awaited, 30s timeout, exit code ignored), with `BEAD_INBOX_ID` and `BEAD_INBOX_BLOCKS` set, so a dispatcher can act at once. Runs in background sessions too |
 
 ## Development
 

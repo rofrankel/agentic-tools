@@ -354,14 +354,14 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
     [
       'Beads that need you: open human gates, and any open issue labelled attn:approval, attn:decision, attn:question, attn:review or attn:feedback.',
       'Status line: a count by kind. Band above the prompt: the top 3, approvals first, then oldest. Toast: when a new one arrives.',
-      'It reads bd every 15s and after any bd command or subagent return. Viewing costs no model tokens, and it survives /clear.',
+      'An interactive session polls; a background or -p session reads bd only when a command or ask_human runs. A poll first checks a cheap signature of the beads store and reads bd only when it changed (or once a minute); without one it reads bd every 60s. It also reads after any bd command or subagent return, and at once after an answer. Viewing costs no model tokens, and it survives /clear.',
       'Projects: when the inbox holds more than one project, each row carries a colored project tag. The color comes from the name, so a project usually keeps it across sessions; if two would match, one takes the next free color. A bead\'s project is its project:<name> label, or else its id prefix.',
     ],
   ],
   [
     'Commands',
     [
-      '/inbox                       open the full list (grouped by kind, with details and buttons)',
+      '/inbox [kind] [project:<name>]  open the full list (grouped by kind, with details and buttons), filtered to a kind and/or a project and its subprojects (project:web holds web:api); bare /inbox clears the filter',
       '/inbox-list [kind|project]   the list as text, with details; narrowed to a kind (approve, decide…) or a project',
       '/inbox-search <words>        items whose id, title, details or project hold every word',
       '/inbox-show <id>             a bead as text: details, comments, what it blocks',
@@ -372,7 +372,8 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
       '/inbox-open <id>             open a bead in its own pane (full details, comments, what it blocks)',
       '/inbox-help                  this help',
       'An id may leave out its prefix (u1y for ait-u1y) when only one item in the inbox ends that way.',
-      'These run at once, even mid-turn, and cost no model tokens. In the pane: Open (the bead in its own pane), Approve, Answer… / Reject… (fills the prompt), Dismiss (agent uses its judgment).',
+      'These run at once, even mid-turn, and cost no model tokens. In the pane: Open (the bead in its own pane), Approve, Answer… / Reject… (fills the prompt), Dismiss (agent uses its judgment). In a mixed inbox a row\'s project tag is a button that filters to that project; Clear in the filter bar shows everything again.',
+      'An answered item leaves the inbox at once. If bd could not save it, it comes back marked "Not saved: <reason>"; answering again redoes only what is missing, and an answer repeated within 2 minutes is not saved twice.',
       'Over Remote Control (/rc) the status line, band and panes may not show: /inbox, /inbox-list, /inbox-search and /inbox-show reply in the transcript, and answering works the same.',
     ],
   ],
@@ -393,7 +394,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
       'Review and feedback block nothing: the bead itself is labelled attn:review / attn:feedback, with the request as a comment.',
       'A repeated question (an agent retrying) is matched to the item already filed, not filed again.',
       'The manager and every new subagent are told to use it instead of asking in prose.',
-      'Backup: when a subagent finishes with questions in prose, Haiku extracts them and files them, marked "(auto-extracted)". Skipped when the report says "User questions: none".',
+      'Backup: when a subagent finishes with questions in prose, a model (Sonnet by default; the extractor model setting) extracts them and files them, marked "(auto-extracted)". Skipped when the report says "User questions: none". Turn it off in /config (auto-extract questions) when your agents file their own.',
       'You can file one by hand: bd gate create --blocks <id> --title "<question>" --reason "<details>", then bd label add <gate-id> attn:decision,project:<name>',
     ],
   ],
@@ -401,7 +402,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
     'Troubleshooting',
     [
       '"No beads database found": start Claude Code in the repo that holds .beads, or set BEADS_DIR.',
-      '"bd failed": the pane shows bd\'s error. The plugin finds bd on PATH, or the real bd.exe behind an npm shim.',
+      '"bd failed": the pane shows bd\'s error. The plugin prefers the real bd.exe (also the one behind an npm shim) over a shell shim, and sends comment text on stdin, so multi-line answers arrive whole. It waits up to 120s for bd and retries once on a database lock.',
       'Pane not showing at startup: it opens by itself only at 144+ columns; use /inbox.',
       'After editing the plugin: /reload-plugins.',
     ],
@@ -539,6 +540,223 @@ export const quickId = (stdout: string): string | undefined =>
     .map(line => line.trim())
     .filter(line => /^[A-Za-z0-9][\w.-]*-[\w.]+$/.test(line))
     .pop()
+
+// ---- bd reliability ----
+
+// bd waits on the database lock while another bd pulls, pushes or writes.
+export const isLockError = (stderr: string): boolean => /\b(lock|locked|locking)\b/i.test(stderr)
+
+// The exit code a timed-out bd run reads as, as timeout(1) uses.
+export const TIMED_OUT = 124
+
+// A timed-out create may still have landed, so it is never retried blindly.
+export const createsSomething = (args: readonly string[]): boolean =>
+  args[0] === 'q' ||
+  args[0] === 'create' ||
+  (args[0] === 'gate' && args[1] === 'create') ||
+  (args[0] === 'comments' && args[1] === 'add')
+
+export type RunResult = { exitCode: number; stdout: string; stderr: string }
+
+// One retry: on a lock error (nothing was written) for any command, or on a
+// timeout for a command that creates nothing.
+export const shouldRetry = (args: readonly string[], result: RunResult): boolean => {
+  if (result.exitCode === 0 || result.exitCode === 127) {
+    return false
+  }
+  if (isLockError(result.stderr)) {
+    return true
+  }
+
+  return result.exitCode === TIMED_OUT && !createsSomething(args)
+}
+
+export const DUPLICATE_WINDOW_MS = 2 * 60_000
+
+export type RawComment = { text?: unknown; created_at?: unknown }
+
+// The latest comment holds the same text and is under two minutes old: this
+// is a retry of an answer already saved. Answers its creation time, if so.
+export const recentDuplicate = (
+  comments: readonly RawComment[],
+  text: string,
+  now: number,
+  windowMs = DUPLICATE_WINDOW_MS,
+): string | undefined => {
+  let latest: { at: number; createdAt: string; text: string } | undefined
+  for (const one of comments) {
+    const createdAt = typeof one.created_at === 'string' ? one.created_at : ''
+    const at = Date.parse(createdAt)
+    if (Number.isNaN(at) || typeof one.text !== 'string') {
+      continue
+    }
+    if (!latest || at >= latest.at) {
+      latest = { at, createdAt, text: one.text }
+    }
+  }
+  if (!latest || latest.text.trim() !== text.trim()) {
+    return undefined
+  }
+
+  // A timestamp in the future (clock skew) counts as just now.
+  return now - latest.at < windowMs ? latest.createdAt : undefined
+}
+
+// ---- the /inbox pane's filter ----
+
+export type InboxFilter = { kind?: AttnKind; project?: string }
+
+// "/inbox decide project:web": words in any order; other words are ignored.
+export const parseInboxArgs = (args: string | undefined): InboxFilter => {
+  const filter: InboxFilter = {}
+  for (const word of (args ?? '').trim().split(/\s+/).filter(Boolean)) {
+    if (/^project:/i.test(word)) {
+      const project = cleanProject(word)
+      if (project) {
+        filter.project = project
+      } else {
+        delete filter.project
+      }
+      continue
+    }
+    const kind = kindNamed(word)
+    if (kind) {
+      filter.kind = kind
+    }
+  }
+
+  return filter
+}
+
+// "web" holds its subprojects ("web:api") but not a lookalike ("webapp").
+export const inProject = (project: string, filter: string): boolean =>
+  project === filter || project.startsWith(`${filter}:`)
+
+export const isFiltered = (filter: InboxFilter): boolean => filter.kind !== undefined || filter.project !== undefined
+
+export const applyFilter = (list: AttnItem[], filter: InboxFilter): AttnItem[] =>
+  sortItems(
+    list.filter(
+      one =>
+        (filter.kind === undefined || one.kind === filter.kind) &&
+        (filter.project === undefined || inProject(one.project, filter.project)),
+    ),
+  )
+
+export const filterText = (filter: InboxFilter, shown: number, total: number): string => {
+  const parts = [
+    filter.project === undefined ? '' : `project ${filter.project}`,
+    filter.kind === undefined ? '' : `kind ${TAG[filter.kind]}`,
+  ].filter(Boolean)
+
+  return `Filter: ${parts.join(' · ')} (${shown} of ${total})`
+}
+
+// ---- inline markdown links ----
+
+export type TextRun = { text: string; href?: string }
+
+// "[text](url)" on one line, the URL without spaces or ")"; the rest is plain.
+export const splitLinks = (text: string): TextRun[] => {
+  const runs: TextRun[] = []
+  const pattern = /\[([^\[\]\n]*)\]\(([^\s)]+)\)/g
+  let last = 0
+  for (const match of text.matchAll(pattern)) {
+    const start = match.index ?? 0
+    if (start > last) {
+      runs.push({ text: text.slice(last, start) })
+    }
+    const href = match[2] ?? ''
+    runs.push({ text: match[1] || href, href })
+    last = start + match[0].length
+  }
+  if (last < text.length || runs.length === 0) {
+    runs.push({ text: text.slice(last) })
+  }
+
+  return runs
+}
+
+// ---- settings ----
+
+// A command line as a person writes it: spaces split, quotes group.
+export const splitCommandLine = (line: string | undefined): string[] => {
+  const words: string[] = []
+  let current = ''
+  let quote: string | undefined
+  let started = false
+  for (const char of (line ?? '').trim()) {
+    if (quote) {
+      if (char === quote) {
+        quote = undefined
+      } else {
+        current += char
+      }
+    } else if (char === '"' || char === "'") {
+      quote = char
+      started = true
+    } else if (/\s/.test(char)) {
+      if (started) {
+        words.push(current)
+      }
+      current = ''
+      started = false
+    } else {
+      current += char
+      started = true
+    }
+  }
+  if (started) {
+    words.push(current)
+  }
+
+  return words
+}
+
+// ---- the snapshot command ----
+
+export type Snapshot = { gates: string; attn: string; started: number } | { error: string }
+
+// One JSON object: gates and attn as bd list prints them, an optional error
+// and the epoch seconds its bd reads began.
+export const parseSnapshot = (stdout: string): Snapshot => {
+  let parsed: unknown
+  try {
+    parsed = jsonFrom(stdout, undefined)
+  } catch {
+    return { error: 'bad snapshot output' }
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { error: 'bad snapshot output' }
+  }
+  const { gates, attn, error, started } = parsed as Record<string, unknown>
+  if (!Array.isArray(gates) || !Array.isArray(attn)) {
+    return { error: `no bd snapshot yet${typeof error === 'string' && error ? `: ${error}` : ''}` }
+  }
+
+  return {
+    gates: JSON.stringify(gates),
+    attn: JSON.stringify(attn),
+    started: typeof started === 'number' && Number.isFinite(started) ? started * 1000 : 0,
+  }
+}
+
+// ---- the beads store signature ----
+
+// Dolt's append-only chunk journal: it grows on every write, never on a read.
+export const DOLT_JOURNAL = 'v'.repeat(32)
+
+export type StorePart = { database: string; journalSize: number; manifest: string }
+
+// Per database the journal's size and the manifest's hash; listing every
+// database, so one added or removed changes it too.
+export const storeSignature = (parts: readonly StorePart[]): string | undefined =>
+  parts.length === 0
+    ? undefined
+    : [...parts]
+        .sort((a, b) => a.database.localeCompare(b.database))
+        .map(one => `${one.database}:${one.journalSize}:${hashOf(one.manifest).toString(16)}`)
+        .join('|')
 
 export const sameQuestion = (a: string, b: string): boolean =>
   a.replace(/\s+/g, ' ').trim().toLowerCase() === b.replace(/\s+/g, ' ').trim().toLowerCase()

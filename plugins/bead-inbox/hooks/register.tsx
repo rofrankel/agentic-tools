@@ -1,19 +1,28 @@
 import { atom, read, update } from 'claude-code'
-import type { CommandRunResult, EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { CommandRunResult, EngineInterface, PluginOptions, Register, RenderChildren } from 'claude-code'
 
 import type { AttnItem, AttnKind, BeadView } from '../types'
 import {
   CHIP_TEXT,
   COLOR,
+  DOLT_JOURNAL,
   HELP,
   KINDS,
   TAG,
+  TIMED_OUT,
   age,
+  applyFilter,
   beadText,
   chipText,
   filterItems,
+  filterText,
+  isFiltered,
+  jsonFrom,
   listText,
   matchId,
+  parseInboxArgs,
+  parseSnapshot,
+  recentDuplicate,
   searchItems,
   cleanProject,
   folderName,
@@ -28,8 +37,12 @@ import {
   projectColors,
   projectLabel,
   projectOf,
+  shouldRetry,
+  splitCommandLine,
   splitIdAndText,
+  splitLinks,
   statusText,
+  storeSignature,
   truncate,
   createdId,
   gateTarget,
@@ -37,6 +50,7 @@ import {
   paneIdFor,
   parseBead,
 } from './lib'
+import type { InboxFilter, RawComment, RunResult, StorePart } from './lib'
 
 const PLUGIN = 'bead-inbox'
 const PANE = 'bead-inbox'
@@ -44,15 +58,26 @@ const HELP_PANE = 'bead-inbox-help'
 const TOOL = 'ask_human'
 const TOOL_ID = 'mcp__bead-inbox__ask_human'
 const FEEDBACK_LABEL = 'human-feedback'
-const POLL_MS = 15_000
 const BAND_ROWS = 3
 const DISMISSED = 'Dismissed by the human without an answer; use your judgment.'
+const BD_TIMEOUT_MS = 120_000
+const SNAPSHOT_TIMEOUT_MS = 120_000
+const ON_ANSWERED_TIMEOUT_MS = 30_000
+// Poll intervals when the poll-interval setting is 0.
+const POLL_DIRECT_MS = 60_000
+const POLL_SNAPSHOT_MS = 15_000
+const POLL_SIGNATURE_MS = 10_000
+// With an unchanged store signature, read bd anyway once the list is this old.
+const MAX_AGE_MS = 60_000
+const EXTRACTOR_MODELS = ['haiku', 'sonnet', 'opus'] as const
 
 const items = atom({ plugin: 'bead-inbox', key: 'items' } as const, [])
 const error = atom({ plugin: 'bead-inbox', key: 'error' } as const, null)
 const now = atom({ plugin: 'bead-inbox', key: 'now' } as const, 0)
 const views = atom({ plugin: 'bead-inbox', key: 'views' } as const, {})
 const loading = atom({ plugin: 'bead-inbox', key: 'loading' } as const, [])
+const filter = atom({ plugin: 'bead-inbox', key: 'filter' } as const, {})
+const notSaved = atom({ plugin: 'bead-inbox', key: 'notSaved' } as const, {})
 
 const GUIDANCE = `Human attention inbox (bead-inbox plugin): whenever you need a decision, approval, answer, review or feedback from the human, call the ${TOOL_ID} tool instead of only writing the question in prose. Prose questions scroll out of sight during long autonomous runs; the tool puts them in a persistent inbox the human sees. Call it once per distinct question and never retry a call that returned a result. Pass \`blocks\` with the bead the question concerns when there is one, and \`project\` when the work belongs to a project other than the session's folder. Decisions, approvals and questions become a beads human gate blocking that bead: do not wait, carry on with other ready work; the answer arrives as the gate's close reason and as a comment on the blocked bead. Review and feedback block nothing: they label the bead attn:review or attn:feedback. When the human responds, their notes are a comment on the bead and it carries the ${FEEDBACK_LABEL} label (reopened if it was closed): address the notes, then remove that label (\`bd label remove <id> ${FEEDBACK_LABEL}\`). Check \`bd list --label ${FEEDBACK_LABEL}\` for feedback still to address. When relaying a subagent's questions, file each one with the tool unless the subagent already did.`
 
@@ -66,14 +91,70 @@ const EXTRACT_SYSTEM = `You read a report a coding subagent handed back to its m
 type Engine = EngineInterface
 type AskInput = { kind?: string; question?: string; details?: string; blocks?: string; project?: string }
 
+type Settings = {
+  extractorModel: (typeof EXTRACTOR_MODELS)[number]
+  autoExtract: boolean
+  pollMs: number | undefined
+  storeSignature: boolean
+  snapshot: string[]
+  snapshotForce: string[]
+  onAnswered: string[]
+}
+
+const readSettings = (options: PluginOptions | undefined): Settings => {
+  const text = (key: string) => (typeof options?.[key] === 'string' ? (options[key] as string) : '')
+  const model = text('extractorModel')
+  const poll = options?.pollSeconds
+
+  return {
+    extractorModel: (EXTRACTOR_MODELS as readonly string[]).includes(model)
+      ? (model as Settings['extractorModel'])
+      : 'sonnet',
+    autoExtract: options?.autoExtract !== false,
+    pollMs: typeof poll === 'number' && poll > 0 ? poll * 1000 : undefined,
+    storeSignature: options?.storeSignature !== false,
+    snapshot: splitCommandLine(text('snapshotCommand')),
+    snapshotForce: splitCommandLine(text('snapshotForceArgs')),
+    onAnswered: splitCommandLine(text('onAnsweredCommand')),
+  }
+}
+
+let settings = readSettings(undefined)
 let bdArgv: string[] | null = null
 let seen: Set<string> | null = null
 let sessionFolder: string | undefined
+let isInteractive = false
 const askedBy = new Map<string, string>()
 const filedBy = new Set<string>()
 
+// Answers in flight or just made, by item id: `pending` while the writes run,
+// then the time they finished. A refresh drops the item until one whose bd
+// reads began after that time, so a poll that read before the answer cannot
+// bring it back.
+// The item and its place are kept, so answering it again (a quick retry)
+// takes the same path, and a failed write puts it back where it was.
+const hidden = new Map<string, { pending: boolean; at: number; item: AttnItem; position: number }>()
+// A comment that saved while the label removal after it failed, by bead: the
+// same answer again only retries the label.
+const labelStuck = new Map<string, string>()
+
+const errorText = (err: unknown): string =>
+  err instanceof Error ? err.message : typeof err === 'string' ? err : 'unknown error'
+
+const cut = (stderr: string): string => truncate(stderr.trim() || 'no error text', 120)
+
+// The engine's clock (a test's mock clock), else the wall clock.
+const clockNow = async ($: Engine): Promise<number> => {
+  try {
+    return await $.clock.now()
+  } catch {
+    return Date.now()
+  }
+}
+
 // The Bash tool finds bd through a shell; a shell-less run cannot start an
-// npm .cmd shim, so look for the real binary once.
+// npm .cmd shim, and through cmd.exe an argument ends at its first newline,
+// so the real binary comes first.
 const findBd = async ($: Engine): Promise<string[] | null> => {
   const tryRun = async (argv: string[]) => {
     try {
@@ -83,17 +164,15 @@ const findBd = async ($: Engine): Promise<string[] | null> => {
       return false
     }
   }
-  for (const candidate of [['bd'], ['bd.exe']]) {
-    if (await tryRun(candidate)) {
-      return candidate
-    }
+  if (await tryRun(['bd.exe'])) {
+    return ['bd.exe']
   }
   try {
     const where = await $.process.run(['where.exe', 'bd'], { timeoutMs: 10_000 })
     for (const line of where.stdout.split(/\r?\n/).map(one => one.trim()).filter(Boolean)) {
       const dir = line.replace(/[\\/][^\\/]+$/, '')
       for (const exe of [
-        line.endsWith('.exe') ? line : `${line}.exe`,
+        line.endsWith('.exe') ? line : `${line.replace(/\.(cmd|bat|ps1)$/i, '')}.exe`,
         `${dir}\\node_modules\\@beads\\bd\\bin\\bd.exe`,
       ]) {
         if (await tryRun([exe])) {
@@ -104,51 +183,182 @@ const findBd = async ($: Engine): Promise<string[] | null> => {
   } catch {
     // not Windows, or where.exe missing: nothing more to try
   }
+  if (await tryRun(['bd'])) {
+    return ['bd']
+  }
 
   return null
 }
 
-const bd = async ($: Engine, args: string[]) => {
+const runOnce = async ($: Engine, argv: string[], stdin: string | undefined, timeoutMs: number, what: string): Promise<RunResult> => {
+  try {
+    const r = await $.process.run(argv, stdin === undefined ? { timeoutMs } : { timeoutMs, stdin })
+
+    return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr }
+  } catch (err) {
+    return { exitCode: TIMED_OUT, stdout: '', stderr: `${what} timed out or could not start: ${errorText(err)}` }
+  }
+}
+
+// Never throws: a timeout or a failed start reads as exit 124. One retry on a
+// lock error, or on a timeout of a command that creates nothing.
+const bd = async ($: Engine, args: string[], stdin?: string): Promise<RunResult> => {
   bdArgv ??= await findBd($)
   if (bdArgv === null) {
     return { exitCode: 127, stdout: '', stderr: 'bd not found on PATH' }
   }
+  const first = await runOnce($, [...bdArgv, ...args], stdin, BD_TIMEOUT_MS, 'bd')
 
-  return $.process.run([...bdArgv, ...args], { timeoutMs: 30_000 })
+  return shouldRetry(args, first) ? runOnce($, [...bdArgv, ...args], stdin, BD_TIMEOUT_MS, 'bd') : first
 }
 
-const refresh = async ($: Engine) => {
+// ---- the beads store signature ----
+
+let beadsDir: string | null | undefined
+
+const parentOf = (path: string): string | undefined => {
+  const trimmed = path.replace(/[\\/]+$/, '')
+  const cutAt = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+
+  return cutAt <= 0 || /^[A-Za-z]:$/.test(trimmed) ? undefined : trimmed.slice(0, cutAt)
+}
+
+// Where bd finds the database: BEADS_DIR, else the nearest .beads above the
+// session's folder.
+const findBeadsDir = async ($: Engine): Promise<string | null> => {
+  const set = await $.env.get('BEADS_DIR').catch(() => undefined)
+  if (set) {
+    return set
+  }
+  let dir: string | undefined = await $.session.cwd()
+  while (dir) {
+    const candidate = `${dir}/.beads`
+    if (await $.fs.exists(candidate).catch(() => false)) {
+      return candidate
+    }
+    dir = parentOf(dir)
+  }
+
+  return null
+}
+
+// File metadata and one small read per database, no bd process: Dolt's
+// journal grows on every write and the manifest changes on every commit,
+// while reads touch neither (modification times are not usable: reads touch
+// them). Undefined for a store it does not recognise.
+const readSignature = async ($: Engine): Promise<string | undefined> => {
+  if (!settings.storeSignature || settings.snapshot.length > 0) {
+    return undefined
+  }
+  try {
+    beadsDir ??= await findBeadsDir($)
+    if (!beadsDir) {
+      return undefined
+    }
+    const parts: StorePart[] = []
+    for (const backend of ['embeddeddolt', 'dolt']) {
+      const root = `${beadsDir}/${backend}`
+      const entries = await $.fs.list(root).catch(() => [])
+      for (const entry of entries) {
+        if (entry.kind !== 'dir') {
+          continue
+        }
+        const noms = `${root}/${entry.name}/.dolt/noms`
+        const manifest = await $.fs.read(`${noms}/manifest`).catch(() => undefined)
+        if (typeof manifest !== 'string') {
+          continue
+        }
+        const journal = await $.fs.stat(`${noms}/${DOLT_JOURNAL}`).catch(() => undefined)
+        parts.push({ database: `${backend}/${entry.name}`, journalSize: journal?.size ?? -1, manifest })
+      }
+    }
+
+    return storeSignature(parts)
+  } catch {
+    return undefined
+  }
+}
+
+// ---- refresh ----
+
+type Reads = { gates: string; attn: string; started: number } | { error: string; isNoDb?: boolean }
+
+const readDirect = async ($: Engine): Promise<Reads> => {
+  const started = await clockNow($)
   const gates = await bd($, ['list', '--type', 'gate', '--status', 'open', '--json', '--limit', '0'])
   const labelled = await bd($, [
     'list', '--status', 'open,in_progress,blocked,closed', '--label-pattern', 'attn:*', '--json', '--limit', '0',
   ])
-  await update($, now, () => Date.now())
   const broken = [gates, labelled].find(r => r.exitCode !== 0)
   if (broken) {
     const isNoDb = /no beads database/i.test(broken.stderr)
-    const message = isNoDb
-      ? `No beads database found from ${await $.session.cwd()}. Start Claude Code in the project repo (or set BEADS_DIR).`
-      : `bd failed: ${truncate(broken.stderr.trim(), 300)}`
+
+    return {
+      isNoDb,
+      error: isNoDb
+        ? `No beads database found from ${await $.session.cwd()}. Start Claude Code in the project repo (or set BEADS_DIR).`
+        : `bd failed: ${truncate(broken.stderr.trim(), 300)}`,
+    }
+  }
+
+  return { gates: gates.stdout, attn: labelled.stdout, started }
+}
+
+const readSnapshot = async ($: Engine, force: boolean): Promise<Reads> => {
+  const argv = [...settings.snapshot, ...(force ? settings.snapshotForce : [])]
+  const r = await runOnce($, argv, undefined, SNAPSHOT_TIMEOUT_MS, 'snapshot command')
+  if (r.exitCode !== 0) {
+    return { error: truncate(r.stderr.trim() || `snapshot command exited ${r.exitCode}`, 300) }
+  }
+
+  return parseSnapshot(r.stdout)
+}
+
+let lastSignature: string | undefined
+let lastRefreshAt = Number.NEGATIVE_INFINITY
+
+const doRefresh = async ($: Engine, force: boolean, known?: string): Promise<void> => {
+  const started = await clockNow($)
+  // Taken before the reads, so a write landing during them shows next poll.
+  const signature = known ?? (await readSignature($))
+  const reads = settings.snapshot.length > 0 ? await readSnapshot($, force) : await readDirect($)
+  await update($, now, () => started)
+  if ('error' in reads) {
     await update($, items, () => [])
-    await update($, error, () => message)
-    $.ui.status(isNoDb ? undefined : '⚑ inbox: bd failed (see /inbox)')
+    await update($, error, () => reads.error)
+    $.ui.status(reads.isNoDb ? undefined : '⚑ inbox: bd failed (see /inbox)')
 
     return
   }
-  let list: AttnItem[]
+  let all: AttnItem[]
   try {
-    list = parseGates(gates.stdout, labelled.stdout)
+    all = parseGates(reads.gates, reads.attn)
   } catch {
     await update($, error, () => 'could not parse bd output')
 
     return
   }
+  lastSignature = signature
+  lastRefreshAt = started
+
+  // An answer in flight stays hidden whatever these reads saw; a finished one
+  // until reads that began after it. Then bd is trusted again.
+  for (const [id, record] of hidden) {
+    if (!record.pending && reads.started > record.at) {
+      hidden.delete(id)
+    }
+  }
+  const list = all.filter(one => !hidden.has(one.id))
+  const present = new Set(all.map(one => one.id))
+  await update($, notSaved, reasons =>
+    Object.fromEntries(Object.entries(reasons).filter(([id]) => present.has(id) && !hidden.has(id))),
+  )
   await update($, items, () => list)
   await update($, error, () => null)
   $.ui.status(statusText(list))
 
   const fresh = seen === null ? [] : list.filter(one => !seen?.has(one.id))
-  seen = new Set(list.map(one => one.id))
+  seen = new Set([...(seen ?? []), ...list.map(one => one.id)].filter(id => present.has(id)))
   const [first] = fresh
   if (fresh.length === 1 && first) {
     const where = isMixed(list) ? ` in ${first.project}` : ''
@@ -157,6 +367,74 @@ const refresh = async ($: Engine) => {
     })
   } else if (fresh.length > 1) {
     $.ui.toast(`⚑ ${fresh.length} new items need you · /inbox`, { timeoutMs: 8000 })
+  }
+}
+
+let running: Promise<void> | null = null
+let queued: Promise<void> | null = null
+
+// One refresh at a time: a request while one runs shares it. A forced one
+// (after our own write) must not, since the running one may have read before
+// the write: it runs once more after it, however many ask.
+const refresh = ($: Engine, options: { force?: boolean; signature?: string } = {}): Promise<void> => {
+  if (!running) {
+    running = doRefresh($, options.force === true, options.signature)
+      .catch(async (err: unknown) => {
+        await update($, error, () => `refresh failed: ${errorText(err)}`)
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        running = null
+      })
+
+    return running
+  }
+  if (!options.force) {
+    return running
+  }
+  queued ??= running.then(() => {
+    queued = null
+
+    return refresh($, { force: true })
+  })
+
+  return queued
+}
+
+// Background refreshes (after writes, bd commands, subagents) belong to a
+// session with a person at it; others read bd only when asked.
+const refreshSoon = ($: Engine, force = false) => {
+  if (isInteractive) {
+    void refresh($, { force })
+  }
+}
+
+// The timer's tick: with a store signature, read bd only when it changed or
+// the list has grown old; without one, every tick (or each minute when the
+// tick is the signature's short one).
+const poll = async ($: Engine) => {
+  if (settings.snapshot.length > 0 || !settings.storeSignature) {
+    return refresh($)
+  }
+  const signature = await readSignature($)
+  const isOld = (await clockNow($)) - lastRefreshAt >= MAX_AGE_MS
+  if (signature === undefined) {
+    return settings.pollMs !== undefined || isOld ? refresh($) : undefined
+  }
+  if (signature !== lastSignature || isOld) {
+    return refresh($, { signature })
+  }
+
+  return undefined
+}
+
+const pollInterval = (): number =>
+  settings.pollMs ??
+  (settings.snapshot.length > 0 ? POLL_SNAPSHOT_MS : settings.storeSignature ? POLL_SIGNATURE_MS : POLL_DIRECT_MS)
+
+const showStatus = async ($: Engine) => {
+  if (!(await read($, error))) {
+    $.ui.status(statusText(await read($, items)))
   }
 }
 
@@ -205,7 +483,11 @@ const fileGate = async (
   // Review and feedback hold nothing up: they go on the work bead itself, so
   // the human's notes land where the agent will act on them.
   if (isFeedbackKind(kind)) {
-    const c = await bd($, ['comments', 'add', target, `Human ${kind} requested: ${question}${reason ? `\n\n${reason}` : ''}`])
+    const c = await bd(
+      $,
+      ['comments', 'add', target, '-f', '-'],
+      `Human ${kind} requested: ${question}${reason ? `\n\n${reason}` : ''}`,
+    )
     if (c.exitCode !== 0) {
       return { error: c.stderr.trim() || 'bd comments add failed' }
     }
@@ -234,32 +516,113 @@ const fileGate = async (
   return { id, blocks: target, isGate: true }
 }
 
+// ---- answering ----
+
+type Saved = { isSaved: true; note: string } | { isSaved: false; stderr: string }
+
+const savedNote = (createdAt: string | undefined, at: number) =>
+  createdAt === undefined
+    ? ' (this answer was already saved, so it wasn\'t added again)'
+    : ` (this answer was already saved ${age(createdAt, at)} ago, so it wasn't added again)`
+
+// Every human comment goes through here: the text on stdin (cmd.exe would cut
+// an argument at its first newline), never twice for one answer.
+const addComment = async ($: Engine, beadId: string, text: string): Promise<Saved> => {
+  if (labelStuck.get(beadId) === text.trim()) {
+    return { isSaved: true, note: savedNote(undefined, 0) }
+  }
+  const alreadySaved = async () => {
+    const list = await bd($, ['comments', beadId, '--json'])
+    if (list.exitCode !== 0) {
+      return undefined
+    }
+    try {
+      const parsed = jsonFrom(list.stdout, [])
+
+      return Array.isArray(parsed) ? recentDuplicate(parsed as RawComment[], text, Date.now()) : undefined
+    } catch {
+      return undefined
+    }
+  }
+  let last: RunResult | undefined
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const earlier = await alreadySaved()
+    if (earlier !== undefined) {
+      return { isSaved: true, note: savedNote(earlier, Date.now()) }
+    }
+    last = await bd($, ['comments', 'add', beadId, '-f', '-'], text)
+    if (last.exitCode === 0) {
+      return { isSaved: true, note: '' }
+    }
+    // A timed-out add may have landed: look again before a second one.
+    if (last.exitCode !== TIMED_OUT) {
+      break
+    }
+  }
+
+  return { isSaved: false, stderr: last?.stderr ?? '' }
+}
+
+// Removes the attn label after the comment saved; remembers a failure so the
+// same answer again retries only the label.
+const removeLabel = async ($: Engine, beadId: string, label: string, comment: string) => {
+  const r = await bd($, ['label', 'remove', beadId, label])
+  if (r.exitCode === 0) {
+    labelStuck.delete(beadId)
+
+    return undefined
+  }
+  labelStuck.set(beadId, comment.trim())
+
+  return `couldn't remove ${label}, so it stays in the inbox and answering again will retry (${cut(r.stderr)})`
+}
+
+// What one answer's writes came to. `stays`: the item goes back in the inbox.
+// `recorded`: the answer is saved somewhere, partial or not.
+type Outcome = { text: string; context?: string[]; stays: boolean; recorded: boolean }
+
+const withProblems = (text: string, problems: string[]) =>
+  problems.length === 0 ? `${text}.` : `${text}; but ${problems.join('; ')}.`
+
 // Leaves the human's review or feedback on the work bead for the agent to
 // address: a comment, the human-feedback label in place of the attn: one, and
 // the bead reopened when it was closed so it shows in bd ready again.
-const leaveFeedback = async ($: Engine, beadId: string, kind: AttnKind, notes: string, attnLabel?: string) => {
-  const c = await bd($, ['comments', 'add', beadId, `Human ${kind}: ${notes}`])
-  if (c.exitCode !== 0) {
-    return `Could not comment on ${beadId}: ${c.stderr.trim()}`
+const leaveFeedback = async (
+  $: Engine,
+  beadId: string,
+  kind: AttnKind,
+  notes: string,
+  attnLabel: string | undefined,
+): Promise<{ saved: Saved; problems: string[]; isLabelStuck: boolean }> => {
+  const comment = `Human ${kind}: ${notes}`
+  const saved = await addComment($, beadId, comment)
+  if (!saved.isSaved) {
+    return { saved, problems: [], isLabelStuck: false }
   }
-  if (attnLabel) {
-    await bd($, ['label', 'remove', beadId, attnLabel])
+  const problems: string[] = []
+  const stuck = attnLabel ? await removeLabel($, beadId, attnLabel, comment) : undefined
+  if (stuck) {
+    problems.push(stuck)
   }
-  await bd($, ['label', 'add', beadId, FEEDBACK_LABEL])
+  const added = await bd($, ['label', 'add', beadId, FEEDBACK_LABEL])
+  if (added.exitCode !== 0) {
+    problems.push(`couldn't add ${FEEDBACK_LABEL} (${cut(added.stderr)})`)
+  }
   const show = await bd($, ['show', beadId, '--json'])
   if (show.exitCode === 0 && /"status":\s*"closed"/.test(show.stdout)) {
-    await bd($, ['reopen', beadId])
+    const reopened = await bd($, ['reopen', beadId])
+    if (reopened.exitCode !== 0) {
+      problems.push(`couldn't reopen ${beadId} (${cut(reopened.stderr)})`)
+    }
   }
 
-  return undefined
+  return { saved, problems, isLabelStuck: stuck !== undefined }
 }
 
 const feedbackContext = (beadId: string, kind: AttnKind, title: string, notes: string) =>
   `[bead-inbox] The human left ${kind} on ${beadId}${title}: ${notes}. It is a comment on ${beadId}, which is labelled ${FEEDBACK_LABEL} (and reopened if it was closed). Address it, then remove the ${FEEDBACK_LABEL} label.`
 
-const resolve = async ($: Engine, id: string, answer: string) => {
-  const list = await read($, items)
-  const item = list.find(one => one.id === id)
+const writeAnswer = async ($: Engine, id: string, item: AttnItem | undefined, answer: string): Promise<Outcome> => {
   const title = item ? ` ("${truncate(item.title, 80)}")` : ''
 
   if (item && isFeedbackKind(item.kind)) {
@@ -269,58 +632,140 @@ const resolve = async ($: Engine, id: string, answer: string) => {
     if (item.isGate) {
       const r = await bd($, ['gate', 'resolve', id, '--reason', `Human ${item.kind} left on ${target ?? 'the gate'}`])
       if (r.exitCode !== 0) {
-        return { text: `Could not resolve ${id}: ${r.stderr.trim()}` }
+        return { text: `Could not resolve ${id}: ${r.stderr.trim()}`, stays: true, recorded: false }
       }
     }
-    if (target) {
-      const problem = await leaveFeedback($, target, item.kind, answer, item.isGate ? undefined : item.label)
-      if (problem) {
-        return { text: problem }
-      }
+    if (!target) {
+      return { text: `Resolved ${id}.`, stays: false, recorded: true }
     }
-    void refresh($)
+    const left = await leaveFeedback($, target, item.kind, answer, item.isGate ? undefined : item.label)
+    if (!left.saved.isSaved) {
+      return item.isGate
+        ? { text: `Resolved ${id}; but couldn't comment on ${target} (${cut(left.saved.stderr)}).`, stays: false, recorded: true }
+        : { text: `Could not comment on ${target}: ${left.saved.stderr.trim()}`, stays: true, recorded: false }
+    }
 
     return {
-      text: `Left ${item.kind} on ${target ?? id}.`,
-      context: [feedbackContext(target ?? id, item.kind, title, answer)],
+      text: withProblems(`Left ${item.kind} on ${target}${left.saved.note}`, left.problems),
+      context: [feedbackContext(target, item.kind, title, answer)],
+      stays: left.isLabelStuck,
+      recorded: true,
     }
   }
 
   // A labelled ordinary issue is work, not a gate: record the answer on it and
   // take the label off, leaving it open for the agent to carry on.
   if (item && !item.isGate) {
-    const c = await bd($, ['comments', 'add', id, `Human answer: ${answer}`])
-    if (c.exitCode !== 0) {
-      return { text: `Could not comment on ${id}: ${c.stderr.trim()}` }
+    const comment = `Human answer: ${answer}`
+    const saved = await addComment($, id, comment)
+    if (!saved.isSaved) {
+      return { text: `Could not comment on ${id}: ${saved.stderr.trim()}`, stays: true, recorded: false }
     }
-    if (item.label) {
-      await bd($, ['label', 'remove', id, item.label])
-    }
-    void refresh($)
+    const stuck = item.label ? await removeLabel($, id, item.label, comment) : undefined
 
     return {
-      text: `Answered ${id}.`,
+      text: withProblems(`Answered ${id}${saved.note}`, stuck ? [stuck] : []),
       context: [`[bead-inbox] The human answered ${id}${title}: ${answer}. The answer is a comment on ${id}.`],
+      stays: stuck !== undefined,
+      recorded: true,
     }
   }
 
+  // The close reason stays an argument: bd reads it from no file.
   const r = await bd($, ['gate', 'resolve', id, '--reason', answer])
   if (r.exitCode !== 0) {
-    return { text: `Could not resolve ${id}: ${r.stderr.trim()}` }
+    return { text: `Could not resolve ${id}: ${r.stderr.trim()}`, stays: true, recorded: false }
   }
+  const problems: string[] = []
+  let note = ''
   if (item?.blocks) {
-    await bd($, ['comments', 'add', item.blocks, `Human answer to ${id} (${item.title}): ${answer}`])
+    const saved = await addComment($, item.blocks, `Human answer to ${id} (${item.title}): ${answer}`)
+    if (saved.isSaved) {
+      note = saved.note
+    } else {
+      problems.push(`couldn't comment on ${item.blocks} (${cut(saved.stderr)})`)
+    }
   }
-  void refresh($)
   const unblocked = item?.blocks ? ` ${item.blocks} is unblocked.` : ''
 
   return {
-    text: `Resolved ${id}.`,
+    text: withProblems(`Resolved ${id}${note}`, problems),
     context: [`[bead-inbox] The human answered gate ${id}${title}: ${answer}.${unblocked}`],
+    stays: false,
+    recorded: true,
   }
 }
 
-const failed = () => ({ text: 'bead-inbox: the command failed; see the debug log.' })
+// Tells an outside dispatcher at once; never awaited, its failures ignored.
+const runOnAnswered = ($: Engine, id: string, blocks: string | undefined) => {
+  if (settings.onAnswered.length === 0) {
+    return
+  }
+  void $.process
+    .run(settings.onAnswered, {
+      timeoutMs: ON_ANSWERED_TIMEOUT_MS,
+      env: { BEAD_INBOX_ID: id, BEAD_INBOX_BLOCKS: blocks ?? '' },
+    })
+    .catch(() => undefined)
+}
+
+// The item leaves the inbox before the first bd write (which can wait minutes
+// on the database lock); if the writes fail it comes back where it was, with
+// the reason.
+const resolve = async ($: Engine, id: string, answer: string): Promise<CommandRunResult> => {
+  const list = await read($, items)
+  const index = list.findIndex(one => one.id === id)
+  const earlier = hidden.get(id)
+  const item = list[index] ?? earlier?.item
+  const position = index >= 0 ? index : (earlier?.position ?? list.length)
+  if (item) {
+    hidden.set(id, { pending: true, at: 0, item, position })
+    await update($, notSaved, reasons => Object.fromEntries(Object.entries(reasons).filter(([one]) => one !== id)))
+    await update($, items, all => all.filter(one => one.id !== id))
+    await showStatus($)
+  }
+  let outcome: Outcome
+  try {
+    outcome = await writeAnswer($, id, item, answer)
+  } catch (err) {
+    outcome = { text: `Could not answer ${id}: ${errorText(err)}`, stays: true, recorded: false }
+  }
+  if (item) {
+    if (outcome.stays) {
+      hidden.delete(id)
+      await update($, items, all =>
+        all.some(one => one.id === id) ? all : [...all.slice(0, position), item, ...all.slice(position)],
+      )
+      await update($, notSaved, reasons => ({ ...reasons, [id]: outcome.text }))
+    } else {
+      hidden.set(id, { pending: false, at: await clockNow($), item, position })
+    }
+    await showStatus($)
+  }
+  if (outcome.recorded) {
+    refreshSoon($, true)
+    runOnAnswered($, id, item?.blocks)
+  }
+
+  return outcome.recorded && outcome.context ? { text: outcome.text, context: outcome.context } : { text: outcome.text }
+}
+
+// A pane button: say so at once, then the result, without holding the press.
+const pressAnswer = ($: Engine, id: string, answer: string) => {
+  $.ui.toast(`${id}: saving…`, { timeoutMs: 4000 })
+  void resolve($, id, answer).then(
+    r => $.ui.toast(r.text ?? `${id}: done`, { timeoutMs: 10_000 }),
+    (err: unknown) => $.ui.toast(`${id}: failed: ${errorText(err)}`, { timeoutMs: 15_000 }),
+  )
+}
+
+// Names the command and the cause, never a bare "see the debug log".
+const failed = (_$: unknown, e: { command?: string }, next: { error?: { kind?: string; message?: string } }) => ({
+  text: `bead-inbox: /${e.command ?? 'command'} failed: ${next.error?.message || next.error?.kind || 'unknown error'}`,
+})
+
+// The host may leave `args` out (a bare /inbox).
+const argsOf = (e: { args?: string }): string => (e.args ?? '').trim()
 
 // Runs `act` on the full id of what the person typed ("u1y" for "ait-u1y").
 // Just after a reload the list is empty until the next poll, so a miss
@@ -328,7 +773,7 @@ const failed = () => ({ text: 'bead-inbox: the command failed; see the debug log
 const withId = async ($: Engine, typed: string, act: (id: string) => Promise<CommandRunResult>) => {
   const inList = (id: string) => read($, items).then(list => list.some(one => one.id === id))
   let match = matchId(await read($, items), typed)
-  if ('id' in match && !(await inList(match.id))) {
+  if ('id' in match && !(await inList(match.id)) && !hidden.has(match.id)) {
     await refresh($)
     match = matchId(await read($, items), typed)
   }
@@ -349,7 +794,7 @@ const openBead = async ($: Engine, beadId: string) => {
   if (item) {
     await update($, views, all => (all[paneId] ? all : { ...all, [paneId]: previewOf(item) }))
   }
-  void $.ui.open({ id: paneId, title: beadId })
+  void $.ui.open({ id: paneId, title: beadId }).catch(() => undefined)
   const shown = await loadBead($, beadId, item?.blocks)
   await update($, views, all => ({ ...all, [paneId]: shown }))
   await update($, loading, ids => ids.filter(one => one !== paneId))
@@ -414,9 +859,18 @@ const previewOf = (item: AttnItem): BeadView => ({
 
 const fillPrompt = ($: Engine, text: string) => $.prompt.fill({ text, mode: 'replace' })
 
-export const register: Register = on => {
+// Sets the pane's filter and brings its top (the filter bar) into view.
+const setFilter = async ($: Engine, next: InboxFilter) => {
+  await update($, filter, () => next)
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => undefined)
+}
+
+export const register: Register = (on, options) => {
+  settings = readSettings(options)
+
   on('session.start', async ($, e, next) => {
     sessionFolder = folderName(e.cwd)
+    isInteractive = e.isInteractive === true
     await $.tool.register({
       name: TOOL,
       description:
@@ -443,7 +897,7 @@ export const register: Register = on => {
       },
     })
     for (const command of [
-      { name: 'inbox', description: 'Show beads that need your attention' },
+      { name: 'inbox', description: 'Show beads that need your attention', argumentHint: '[kind] [project:<name>]' },
       { name: 'inbox-list', description: 'List the inbox as text, with details', argumentHint: '[kind|project]' },
       { name: 'inbox-search', description: 'Find inbox items holding every word', argumentHint: '<words>' },
       { name: 'inbox-show', description: 'Show a bead as text: details, comments, what it blocks', argumentHint: '<bead-id>' },
@@ -456,9 +910,13 @@ export const register: Register = on => {
     ]) {
       await $.command.register({ ...command, immediate: true })
     }
-    $.clock.every(POLL_MS, () => void refresh($))
-    void refresh($)
-    void $.ui.open({ id: PANE, title: 'Needs you' })
+    // Only a session with a person at it keeps the band and the pane fresh:
+    // background and -p sessions would only add to the lock contention.
+    if (isInteractive) {
+      $.clock.every(pollInterval(), () => void poll($))
+      void refresh($)
+      void $.ui.open({ id: PANE, title: 'Needs you' }).catch(() => undefined)
+    }
 
     return next(e)
   })
@@ -511,7 +969,7 @@ export const register: Register = on => {
     if ('error' in filed) {
       return { deny: `Could not file the question: ${filed.error}` }
     }
-    void refresh($)
+    refreshSoon($, true)
 
     return {
       result: filed.isGate
@@ -525,21 +983,28 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     if ((e.tool === 'Bash' && /\bbd\b/.test(e.command)) || e.tool === 'Agent') {
-      void refresh($)
+      refreshSoon($)
     }
 
     return ran
   })
 
   // Backup for subagents that asked in prose: pull the questions out with a
-  // cheap model, outside the main context, and file them as gates.
+  // model, outside the main context, and file them as gates. Off when the
+  // agents file their own.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     const agentId = e.agentId
-    if (agentId && e.reason === 'answer' && !filedBy.has(agentId) && mightHoldQuestions(e.answer)) {
+    if (
+      settings.autoExtract &&
+      agentId &&
+      e.reason === 'answer' &&
+      !filedBy.has(agentId) &&
+      mightHoldQuestions(e.answer)
+    ) {
       void (async () => {
         const r = await $.model.complete({
-          model: 'haiku',
+          model: settings.extractorModel,
           system: EXTRACT_SYSTEM,
           prompt: e.answer.slice(-16_000),
           maxTokens: 2000,
@@ -554,15 +1019,15 @@ export const register: Register = on => {
         for (const one of parseExtracted(r.text)) {
           await fileGate($, one.kind, one.question, one.details, undefined, source, project)
         }
-        void refresh($)
-      })()
+        refreshSoon($, true)
+      })().catch(() => undefined)
     }
 
     return done
   })
 
   on('command.run', { command: 'inbox-open' }, async ($, e) => {
-    const beadId = e.args.trim().split(/\s+/)[0]
+    const beadId = argsOf(e).split(/\s+/)[0]
     if (!beadId) {
       return { text: 'Usage: /inbox-open <bead-id>' }
     }
@@ -579,7 +1044,10 @@ export const register: Register = on => {
     if (!paneId.startsWith('bead-') || paneId === HELP_PANE || paneId === PANE) {
       return next(e)
     }
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const { Box, Button, Link, Text } = $.ui.resolve(e)
+    // Inline markdown links drawn as links; the rest stays plain, in order.
+    const linked = (text: string) =>
+      splitLinks(text).map(run => (run.href ? <Link href={run.href}>{run.text}</Link> : run.text))
     const view = (await read($, views))[paneId]
     const isLoading = (await read($, loading)).includes(paneId)
     if (!view) {
@@ -598,6 +1066,7 @@ export const register: Register = on => {
     }
     const list = await read($, items)
     const item = list.find(one => one.id === view.id)
+    const reason = (await read($, notSaved))[view.id]
     const project = isMixed(list) ? (item?.project ?? projectOf(view.id, view.labels)) : undefined
     const colorOf = projectColors(list.map(one => one.project))
     const meta = [
@@ -626,9 +1095,14 @@ export const register: Register = on => {
         <Text dimColor>
           created {view.createdAt} · updated {view.updatedAt}
         </Text>
+        {reason ? (
+          <Text color="warning" wrap="wrap">
+            Not saved: {reason}
+          </Text>
+        ) : null}
         <Box flexDirection="row" gap={1} marginTop={1}>
           {item?.kind === 'approval' ? (
-            <Button key="approve" label="Approve" onPress={() => resolve($, view.id, 'APPROVED')} />
+            <Button key="approve" label="Approve" onPress={() => pressAnswer($, view.id, 'APPROVED')} />
           ) : null}
           {item ? (
             <Button
@@ -645,7 +1119,7 @@ export const register: Register = on => {
             <Text bold color="claude">
               {section.heading}
             </Text>
-            <Text wrap="wrap">{section.text}</Text>
+            <Text wrap="wrap">{linked(section.text)}</Text>
           </Box>
         ))}
         {view.blocks ? (
@@ -661,7 +1135,7 @@ export const register: Register = on => {
             </Box>
             {view.blocks.description ? (
               <Text dimColor wrap="wrap">
-                {truncate(view.blocks.description, 1500)}
+                {linked(truncate(view.blocks.description, 1500))}
               </Text>
             ) : null}
           </Box>
@@ -690,7 +1164,7 @@ export const register: Register = on => {
               <Text dimColor>
                 {comment.author} · {comment.createdAt}
               </Text>
-              <Text wrap="wrap">{comment.text}</Text>
+              <Text wrap="wrap">{linked(comment.text)}</Text>
             </Box>
           ))}
         </Box>
@@ -727,35 +1201,41 @@ export const register: Register = on => {
 
   // Each list command replies in text as well, so it reads the same over
   // Remote Control, where the band and the pane may not show.
-  on('command.run', { command: 'inbox' }, async $ => {
+  on('command.run', { command: 'inbox' }, async ($, e) => {
+    await setFilter($, parseInboxArgs(argsOf(e)))
     await refresh($)
     // Where nothing draws a pane the reply below still answers.
     await $.ui.open({ id: PANE, title: 'Needs you' }).catch(() => undefined)
     const list = await read($, items)
-    const reply = await replyWith($, list, 'Nothing needs you.', false)
-    if (list.length === 0) {
-      return reply
+    const chosen = await read($, filter)
+    const shown = isFiltered(chosen) ? applyFilter(list, chosen) : list
+    const reply = await replyWith($, shown, list.length === 0 ? 'Nothing needs you.' : 'Nothing matches the filter.', false)
+    if (shown.length === 0) {
+      return list.length === 0 || (await read($, error)) ? reply : { text: `0 of ${list.length} items need you: ${reply.text}` }
     }
+    const count = isFiltered(chosen)
+      ? `${shown.length} of ${list.length} item${list.length === 1 ? ' needs' : 's need'} you`
+      : `${list.length} item${list.length === 1 ? ' needs' : 's need'} you`
 
-    return { text: `${list.length} item${list.length === 1 ? ' needs' : 's need'} you:\n\n${reply.text}` }
+    return { text: `${count}:\n\n${reply.text}` }
   }).catch(failed)
 
   on('command.run', { command: 'inbox-list' }, async ($, e) => {
     await refresh($)
     const list = await read($, items)
-    const filter = e.args.trim()
-    const narrowed = filterItems(list, filter)
+    const word = argsOf(e)
+    const narrowed = filterItems(list, word)
     if (!narrowed && list.length > 0) {
       const projects = [...new Set(list.map(one => one.project))].join(', ')
 
-      return { text: `"${filter}" is neither a kind (${KINDS.map(kind => TAG[kind]).join(', ')}) nor a project in the inbox (${projects}).` }
+      return { text: `"${word}" is neither a kind (${KINDS.map(kind => TAG[kind]).join(', ')}) nor a project in the inbox (${projects}).` }
     }
 
-    return replyWith($, narrowed, filter ? `Nothing in the inbox for "${filter}".` : 'Nothing needs you.', true)
+    return replyWith($, narrowed, word ? `Nothing in the inbox for "${word}".` : 'Nothing needs you.', true)
   }).catch(failed)
 
   on('command.run', { command: 'inbox-search' }, async ($, e) => {
-    const query = e.args.trim()
+    const query = argsOf(e)
     if (!query) {
       return { text: 'Usage: /inbox-search <words>' }
     }
@@ -765,7 +1245,7 @@ export const register: Register = on => {
   }).catch(failed)
 
   on('command.run', { command: 'inbox-show' }, async ($, e) => {
-    const beadId = e.args.trim().split(/\s+/)[0]
+    const beadId = argsOf(e).split(/\s+/)[0]
     if (!beadId) {
       return { text: 'Usage: /inbox-show <bead-id>' }
     }
@@ -774,13 +1254,15 @@ export const register: Register = on => {
       const item = (await read($, items)).find(one => one.id === id)
       const view = await loadBead($, id, item?.blocks)
       const how = item?.kind === 'approval' ? `/approve ${id} [note] or /reject ${id} <reason>` : `/answer ${id} <text>`
+      const reason = (await read($, notSaved))[id]
+      const body = item && !view.error ? `${beadText(view)}\n\nReply: ${how}` : beadText(view)
 
-      return { text: item && !view.error ? `${beadText(view)}\n\nReply: ${how}` : beadText(view) }
+      return { text: reason ? `Not saved: ${reason}\n\n${body}` : body }
     })
   }).catch(failed)
 
   on('command.run', { command: 'inbox-dismiss' }, async ($, e) => {
-    const beadId = e.args.trim().split(/\s+/)[0]
+    const beadId = argsOf(e).split(/\s+/)[0]
     if (!beadId) {
       return { text: 'Usage: /inbox-dismiss <id>' }
     }
@@ -789,7 +1271,7 @@ export const register: Register = on => {
   }).catch(failed)
 
   on('command.run', { command: 'answer' }, async ($, e) => {
-    const parsed = splitIdAndText(e.args)
+    const parsed = splitIdAndText(argsOf(e))
     if (!parsed?.text) {
       return { text: 'Usage: /answer <gate-id> <answer>' }
     }
@@ -798,7 +1280,7 @@ export const register: Register = on => {
   }).catch(failed)
 
   on('command.run', { command: 'approve' }, async ($, e) => {
-    const parsed = splitIdAndText(e.args)
+    const parsed = splitIdAndText(argsOf(e))
     if (!parsed) {
       return { text: 'Usage: /approve <gate-id> [note]' }
     }
@@ -807,7 +1289,7 @@ export const register: Register = on => {
   }).catch(failed)
 
   on('command.run', { command: 'reject' }, async ($, e) => {
-    const parsed = splitIdAndText(e.args)
+    const parsed = splitIdAndText(argsOf(e))
     if (!parsed?.text) {
       return { text: 'Usage: /reject <gate-id> <reason>' }
     }
@@ -850,27 +1332,41 @@ export const register: Register = on => {
     )
   })
 
+  // Every item, grouped by kind; the pane scrolls.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const list = await read($, items)
-    const failed = await read($, error)
+    const failure = await read($, error)
     const at = await read($, now)
-    const room = Math.max(4, (e.viewport?.rows ?? 30) - 2)
+    const chosen = await read($, filter)
+    const reasons = await read($, notSaved)
 
-    if (failed) {
-      return <Text color="warning" wrap="wrap">{failed}</Text>
+    if (failure) {
+      return <Text color="warning" wrap="wrap">{failure}</Text>
     }
-    if (list.length === 0) {
+    const filtered = isFiltered(chosen)
+    if (list.length === 0 && !filtered) {
       return <Text dimColor>Nothing needs you. Gates filed by agents show here.</Text>
     }
 
+    const shown = filtered ? applyFilter(list, chosen) : list
     const mixed = isMixed(list)
     const colorOf = projectColors(list.map(one => one.project))
     const rows: RenderChildren[] = []
-    let used = 0
+    if (filtered) {
+      rows.push(
+        <Box key="filter" flexDirection="row" gap={1} marginBottom={1}>
+          <Text wrap="wrap">{filterText(chosen, shown.length, list.length)}</Text>
+          <Button key="filter:clear" label="Clear" dimColor onPress={() => setFilter($, {})} />
+        </Box>,
+      )
+    }
+    if (shown.length === 0) {
+      rows.push(<Text dimColor>Nothing matches the filter.</Text>)
+    }
     for (const kind of KINDS) {
-      const group = list.filter(one => one.kind === kind)
-      if (group.length === 0 || used >= room) {
+      const group = shown.filter(one => one.kind === kind)
+      if (group.length === 0) {
         continue
       }
       rows.push(
@@ -878,26 +1374,35 @@ export const register: Register = on => {
           {TAG[kind].toUpperCase()} ({group.length})
         </Text>,
       )
-      used += 1
       for (const item of group) {
-        if (used >= room) {
-          break
-        }
+        const reason = reasons[item.id]
         rows.push(
           <Box key={item.id} flexDirection="column" marginBottom={1}>
-            <Text wrap="wrap">
+            <Box flexDirection="row" gap={1}>
               {mixed ? (
-                <Text color={CHIP_TEXT} backgroundColor={colorOf(item.project)}>
-                  {chipText(item.project)}
-                </Text>
+                <Button
+                  key={`${item.id}:tag`}
+                  plain
+                  onPress={() => setFilter($, { ...chosen, project: item.project })}
+                >
+                  <Text color={CHIP_TEXT} backgroundColor={colorOf(item.project)}>
+                    {chipText(item.project)}
+                  </Text>
+                </Button>
               ) : null}
-              {mixed ? ' ' : ''}
-              <Text bold>{item.title}</Text>{' '}
-              <Text dimColor>
-                {item.id}
-                {item.blocks ? ` → ${item.blocks}` : ''} · {age(item.createdAt, at)}
+              <Text wrap="wrap">
+                <Text bold>{item.title}</Text>{' '}
+                <Text dimColor>
+                  {item.id}
+                  {item.blocks ? ` → ${item.blocks}` : ''} · {age(item.createdAt, at)}
+                </Text>
               </Text>
-            </Text>
+            </Box>
+            {reason ? (
+              <Text color="warning" wrap="wrap">
+                Not saved: {reason}
+              </Text>
+            ) : null}
             {item.details ? (
               <Text dimColor wrap="wrap">
                 {truncate(item.details, 600)}
@@ -906,7 +1411,7 @@ export const register: Register = on => {
             <Box flexDirection="row" gap={1}>
               <Button key={`${item.id}:open`} label="Open" onPress={() => openBead($, item.id)} />
               {item.kind === 'approval' ? (
-                <Button key={`${item.id}:approve`} label="Approve" onPress={() => resolve($, item.id, 'APPROVED')} />
+                <Button key={`${item.id}:approve`} label="Approve" onPress={() => pressAnswer($, item.id, 'APPROVED')} />
               ) : null}
               {item.kind === 'approval' ? (
                 <Button key={`${item.id}:reject`} label="Reject…" onPress={() => fillPrompt($, `/reject ${item.id} `)} />
@@ -917,12 +1422,11 @@ export const register: Register = on => {
                 key={`${item.id}:dismiss`}
                 label="Dismiss"
                 dimColor
-                onPress={() => resolve($, item.id, DISMISSED)}
+                onPress={() => pressAnswer($, item.id, DISMISSED)}
               />
             </Box>
           </Box>,
         )
-        used += item.details ? 4 : 3
       }
     }
 

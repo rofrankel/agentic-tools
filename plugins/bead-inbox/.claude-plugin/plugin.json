@@ -7,5 +7,50 @@
   "repository": "https://github.com/rofrankel/agentic-tools",
   "license": "MIT",
   "keywords": ["beads", "bd", "inbox", "human-in-the-loop", "gates", "subagents"],
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "extractorModel": {
+      "type": "string",
+      "title": "Extractor model",
+      "description": "The model that pulls human questions out of a subagent's prose report (the auto-extraction backup).",
+      "default": "sonnet",
+      "options": ["haiku", "sonnet", "opus"]
+    },
+    "autoExtract": {
+      "type": "boolean",
+      "title": "Auto-extract questions from subagent reports",
+      "description": "When a subagent finishes with questions in prose, file them for you. Turn off when your agents file their own with ask_human, to avoid duplicates.",
+      "default": true
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Poll interval (seconds)",
+      "description": "How often an interactive session checks for changes. 0 picks one: 10s while the beads store signature works (bd is read only when the store changed, or once a minute), 15s with a snapshot command, else 60s.",
+      "default": 0
+    },
+    "storeSignature": {
+      "type": "boolean",
+      "title": "Read bd only when the beads store changed",
+      "description": "Before each poll, compare a cheap signature of the store's files (Dolt's journal size and manifest) with the last one, and skip bd when nothing changed. Falls back to timed reads when the store isn't recognised.",
+      "default": true
+    },
+    "snapshotCommand": {
+      "type": "string",
+      "title": "Snapshot command",
+      "description": "Optional command that prints one JSON object {gates, attn, error?, started?} in place of the plugin's own bd list calls, for sessions sharing one database. Empty: read bd directly.",
+      "default": ""
+    },
+    "snapshotForceArgs": {
+      "type": "string",
+      "title": "Snapshot force arguments",
+      "description": "Arguments added to the snapshot command after the plugin's own writes, so the reader skips its cache.",
+      "default": ""
+    },
+    "onAnsweredCommand": {
+      "type": "string",
+      "title": "On-answered command",
+      "description": "Optional command run (not awaited, 30s timeout) after every saved answer, with BEAD_INBOX_ID and BEAD_INBOX_BLOCKS in its environment, so a dispatcher can act at once.",
+      "default": ""
+    }
+  }
 }
