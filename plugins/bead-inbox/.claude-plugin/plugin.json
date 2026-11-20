@@ -22,16 +22,22 @@
       "description": "When a subagent finishes with questions in prose, file them for you. Turn off when your agents file their own with ask_human, to avoid duplicates.",
       "default": true
     },
-    "pollSeconds": {
+    "checkSeconds": {
       "type": "number",
-      "title": "Poll interval (seconds)",
-      "description": "How often an interactive session checks for changes. 0 picks one: 10s while the beads store signature works (bd is read only when the store changed, or once a minute), 15s with a snapshot command, else 60s.",
-      "default": 0
+      "title": "Change check interval (seconds)",
+      "description": "How often an interactive session looks for changes: the beads store signature (file metadata, no bd process), or the snapshot command when one is set. bd is read only when the look finds a change.",
+      "default": 10
+    },
+    "refreshSeconds": {
+      "type": "number",
+      "title": "Full refresh interval (seconds)",
+      "description": "bd is read at least this often whatever the check finds, as a safety net; without a store signature (unrecognised store, or the signature turned off), this is how often bd is read.",
+      "default": 60
     },
     "storeSignature": {
       "type": "boolean",
       "title": "Read bd only when the beads store changed",
-      "description": "Before each poll, compare a cheap signature of the store's files (Dolt's journal size and manifest) with the last one, and skip bd when nothing changed. Falls back to timed reads when the store isn't recognised.",
+      "description": "Before each poll, compare a cheap signature of the store's files (Dolt's journal size and manifest) with the last one, and skip bd when nothing changed. Off, or with a store it doesn't recognise, bd is read every full refresh interval.",
       "default": true
     },
     "snapshotCommand": {

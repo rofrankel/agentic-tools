@@ -135,6 +135,20 @@ test('an interactive session polls on the timer', { options: { storeSignature: f
   expect(lists(calls)).toBe(4)
 })
 
+test('the check and full refresh intervals are settings', { options: { checkSeconds: 5, refreshSeconds: 20, storeSignature: false } }, async ($, on) => {
+  host(on)
+  const clock = mock.clock(on as never, { now: 1_000_000 })
+  const calls = fakeRun(on, [gate('g-1')])
+  await start($, true)
+  await clock.settle()
+  expect(lists(calls)).toBe(2)
+
+  await clock.advance(15_000)
+  expect(lists(calls)).toBe(2)
+  await clock.advance(5_000)
+  expect(lists(calls)).toBe(4)
+})
+
 test('a snapshot command replaces the bd list calls', { options: { snapshotCommand: 'snap --json' } }, async ($, on) => {
   let stdout = JSON.stringify({ gates: [gate('g-1')], attn: [gate('t-1', 'question')], started: 1 })
   const calls = fakeRun(on, [], call => (call.argv[0] === 'snap' ? answer(stdout) : undefined))
@@ -184,7 +198,7 @@ test('forced refreshes during a slow one cause exactly one more', async ($, on) 
 test('the on-answered command runs once per saved answer, never for a failed one', { options: { onAnsweredCommand: 'dispatch --now' } }, async ($, on) => {
   const blocking = { ...gate('g-1'), description: 'Ad-hoc gate blocking w-1' }
   const calls = fakeRun(on, [blocking, gate('g-2'), gate('g-3')], call =>
-    call.argv[1] === 'gate' && call.argv[3] === 'g-2' ? answer('', 1, 'no such gate') : undefined,
+    call.argv[1] === 'close' && call.argv[2] === 'g-2' ? answer('', 1, 'no such gate') : undefined,
   )
   await run($, 'inbox')
   await run($, 'answer', 'g-1 A')
@@ -214,19 +228,51 @@ test('the real bd.exe comes first, and a multi-line answer goes whole on stdin',
   expect(add?.stdin).toBe('Human answer: line one\nline "two" & 100%\nline ^three')
 })
 
-test('with no bd.exe, plain bd is used', async ($, on) => {
+test('without where.exe (not Windows), plain bd is used', async ($, on) => {
   const calls = fakeRun(on, [gate('g-1')], call => {
     if (call.argv[0] === 'bd.exe') {
       return answer('', 1, 'not found')
     }
     if (call.argv[0] === 'where.exe') {
-      return answer('', 1)
+      throw new Error('ENOENT')
     }
     return undefined
   })
   await run($, 'inbox')
 
   expect(calls.filter(call => call.argv[1] === 'list').map(call => call.argv[0])).toEqual(['bd', 'bd'])
+})
+
+test("on Windows, npm's bundled bd.exe is found behind the shim", async ($, on) => {
+  const bundled = 'C:\\npm\\node_modules\\@beads\\bd\\bin\\bd.exe'
+  const calls = fakeRun(on, [gate('g-1')], call => {
+    if (call.argv[0] === 'where.exe') {
+      return answer('C:\\npm\\bd\r\nC:\\npm\\bd.cmd\r\n')
+    }
+    if (call.argv[0] !== bundled) {
+      return answer('', 1, 'not found')
+    }
+    return undefined
+  })
+  await run($, 'inbox')
+
+  expect(calls.filter(call => call.argv[1] === 'list').map(call => call.argv[0])).toEqual([bundled, bundled])
+})
+
+test('on Windows with only a shell shim, bd is never run through it and the inbox says why', async ($, on) => {
+  const calls = fakeRun(on, [gate('g-1')], call => {
+    if (call.argv[0] === 'where.exe') {
+      return answer('C:\\npm\\bd\r\nC:\\npm\\bd.cmd\r\n')
+    }
+    // Every bd.exe candidate is missing; plain bd and the shim would run.
+    return /\.exe$/i.test(call.argv[0] ?? '') ? answer('', 1, 'not found') : undefined
+  })
+  const text = await run($, 'inbox')
+
+  expect(text).toContain('found no bd.exe, only C:\\npm\\bd, C:\\npm\\bd.cmd')
+  expect(text).toContain('cuts every argument at its first newline')
+  expect(calls.filter(call => call.argv[1] === 'list')).toEqual([])
+  expect(calls.some(call => call.argv[0] === 'bd' || call.argv[0] === 'C:\\npm\\bd.cmd')).toBe(false)
 })
 
 // ---- §10: the store signature ----

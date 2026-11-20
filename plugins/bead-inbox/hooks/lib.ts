@@ -152,6 +152,34 @@ export const parseGates = (...stdouts: string[]): AttnItem[] => {
   return sortItems([...byId.values()].filter(isWanted).map(toItem))
 }
 
+// A bead the inbox doesn't list (typed by hand, or not polled yet), as
+// `bd show <id> --json` prints it: the inbox item it is, or why there is
+// nothing to answer. bd close closes any issue, so this is the guard that
+// keeps an answer from closing ordinary work.
+export const lookupItem = (stdout: string, id: string): AttnItem | { reason: string } => {
+  let parsed: unknown
+  try {
+    parsed = jsonFrom(stdout, [])
+  } catch {
+    return { reason: `could not read bd's output for ${id}` }
+  }
+  const all = (Array.isArray(parsed) ? parsed : [parsed]).filter(
+    (one): one is RawGate => typeof one === 'object' && one !== null && typeof (one as RawGate).id === 'string',
+  )
+  const raw = all.find(one => one.id === id) ?? all[0]
+  if (!raw) {
+    return { reason: `${id} not found` }
+  }
+  if (isWanted(raw)) {
+    return toItem({ ...raw, created_at: raw.created_at ?? '' })
+  }
+  if (raw.issue_type === 'gate') {
+    return { reason: raw.status === 'closed' ? `${raw.id} is already closed` : `${raw.id} is not a human gate` }
+  }
+
+  return { reason: `${raw.id} is neither a human gate nor labelled attn:*, so there is nothing to answer` }
+}
+
 export const sortItems = (list: AttnItem[]): AttnItem[] =>
   [...list].sort(
     (a, b) =>
@@ -354,7 +382,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
     [
       'Beads that need you: open human gates, and any open issue labelled attn:approval, attn:decision, attn:question, attn:review or attn:feedback.',
       'Status line: a count by kind. Band above the prompt: the top 3, approvals first, then oldest. Toast: when a new one arrives.',
-      'An interactive session polls; a background or -p session reads bd only when a command or ask_human runs. A poll first checks a cheap signature of the beads store and reads bd only when it changed (or once a minute); without one it reads bd every 60s. It also reads after any bd command or subagent return, and at once after an answer. Viewing costs no model tokens, and it survives /clear.',
+      'An interactive session polls; a background or -p session reads bd only when a command or ask_human runs. Every 10s it checks a cheap signature of the beads store and reads bd only when it changed, or once a minute anyway; without a signature it reads bd once a minute (both are settings in /config). It also reads after any bd command or subagent return, and at once after an answer. Viewing costs no model tokens, and it survives /clear.',
       'Projects: when the inbox holds more than one project, each row carries a colored project tag. The color comes from the name, so a project usually keeps it across sessions; if two would match, one takes the next free color. A bead\'s project is its project:<name> label, or else its id prefix.',
     ],
   ],
@@ -402,7 +430,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
     'Troubleshooting',
     [
       '"No beads database found": start Claude Code in the repo that holds .beads, or set BEADS_DIR.',
-      '"bd failed": the pane shows bd\'s error. The plugin prefers the real bd.exe (also the one behind an npm shim) over a shell shim, and sends comment text on stdin, so multi-line answers arrive whole. It waits up to 120s for bd and retries once on a database lock.',
+      '"bd failed": the pane shows bd\'s error. On Windows the plugin runs a real bd.exe (on PATH, or the one bundled behind npm\'s shim), never a shell shim, which would cut every argument at its first newline; with only a shim the error says so. Answers go to bd on stdin, so multi-line answers arrive whole. It waits up to 120s for bd and retries once on a database lock.',
       'Pane not showing at startup: it opens by itself only at 144+ columns; use /inbox.',
       'After editing the plugin: /reload-plugins.',
     ],

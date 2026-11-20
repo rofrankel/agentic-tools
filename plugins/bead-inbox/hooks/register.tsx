@@ -30,6 +30,7 @@ import {
   isKind,
   isMixed,
   isRepeat,
+  lookupItem,
   labelledProject,
   mightHoldQuestions,
   parseExtracted,
@@ -63,12 +64,9 @@ const DISMISSED = 'Dismissed by the human without an answer; use your judgment.'
 const BD_TIMEOUT_MS = 120_000
 const SNAPSHOT_TIMEOUT_MS = 120_000
 const ON_ANSWERED_TIMEOUT_MS = 30_000
-// Poll intervals when the poll-interval setting is 0.
-const POLL_DIRECT_MS = 60_000
-const POLL_SNAPSHOT_MS = 15_000
-const POLL_SIGNATURE_MS = 10_000
-// With an unchanged store signature, read bd anyway once the list is this old.
-const MAX_AGE_MS = 60_000
+// The defaults of the two poll settings, in seconds.
+const CHECK_SECONDS = 10
+const REFRESH_SECONDS = 60
 const EXTRACTOR_MODELS = ['haiku', 'sonnet', 'opus'] as const
 
 const items = atom({ plugin: 'bead-inbox', key: 'items' } as const, [])
@@ -94,7 +92,10 @@ type AskInput = { kind?: string; question?: string; details?: string; blocks?: s
 type Settings = {
   extractorModel: (typeof EXTRACTOR_MODELS)[number]
   autoExtract: boolean
-  pollMs: number | undefined
+  // How often an interactive session looks for a change (cheap), and how
+  // often it reads bd whatever that look found.
+  checkMs: number
+  refreshMs: number
   storeSignature: boolean
   snapshot: string[]
   snapshotForce: string[]
@@ -104,14 +105,19 @@ type Settings = {
 const readSettings = (options: PluginOptions | undefined): Settings => {
   const text = (key: string) => (typeof options?.[key] === 'string' ? (options[key] as string) : '')
   const model = text('extractorModel')
-  const poll = options?.pollSeconds
+  // A missing or unusable number is its default.
+  const seconds = (key: string, fallback: number) => {
+    const value = options?.[key]
+    return (typeof value === 'number' && Number.isFinite(value) && value >= 1 ? value : fallback) * 1000
+  }
 
   return {
     extractorModel: (EXTRACTOR_MODELS as readonly string[]).includes(model)
       ? (model as Settings['extractorModel'])
       : 'sonnet',
     autoExtract: options?.autoExtract !== false,
-    pollMs: typeof poll === 'number' && poll > 0 ? poll * 1000 : undefined,
+    checkMs: seconds('checkSeconds', CHECK_SECONDS),
+    refreshMs: seconds('refreshSeconds', REFRESH_SECONDS),
     storeSignature: options?.storeSignature !== false,
     snapshot: splitCommandLine(text('snapshotCommand')),
     snapshotForce: splitCommandLine(text('snapshotForceArgs')),
@@ -152,10 +158,11 @@ const clockNow = async ($: Engine): Promise<number> => {
   }
 }
 
-// The Bash tool finds bd through a shell; a shell-less run cannot start an
-// npm .cmd shim, and through cmd.exe an argument ends at its first newline,
-// so the real binary comes first.
-const findBd = async ($: Engine): Promise<string[] | null> => {
+// bd itself, never a shell shim. On Windows plain "bd" resolves to npm's
+// bd.cmd, and through cmd.exe every argument is cut at its first newline
+// without an error, so a multi-line answer or a gate's details would be
+// saved half. A real executable gets every argument exactly as given.
+const findBd = async ($: Engine): Promise<{ argv: string[] } | { error: string }> => {
   const tryRun = async (argv: string[]) => {
     try {
       const r = await $.process.run([...argv, 'version'], { timeoutMs: 10_000 })
@@ -165,29 +172,37 @@ const findBd = async ($: Engine): Promise<string[] | null> => {
     }
   }
   if (await tryRun(['bd.exe'])) {
-    return ['bd.exe']
+    return { argv: ['bd.exe'] }
   }
+  let where: { stdout: string } | undefined
   try {
-    const where = await $.process.run(['where.exe', 'bd'], { timeoutMs: 10_000 })
-    for (const line of where.stdout.split(/\r?\n/).map(one => one.trim()).filter(Boolean)) {
-      const dir = line.replace(/[\\/][^\\/]+$/, '')
-      for (const exe of [
-        line.endsWith('.exe') ? line : `${line.replace(/\.(cmd|bat|ps1)$/i, '')}.exe`,
-        `${dir}\\node_modules\\@beads\\bd\\bin\\bd.exe`,
-      ]) {
-        if (await tryRun([exe])) {
-          return [exe]
-        }
+    where = await $.process.run(['where.exe', 'bd'], { timeoutMs: 10_000 })
+  } catch {
+    where = undefined
+  }
+  // No where.exe: not Windows, where "bd" on PATH runs without a shell.
+  if (where === undefined) {
+    return (await tryRun(['bd'])) ? { argv: ['bd'] } : { error: 'bd not found on PATH' }
+  }
+  const found = where.stdout.split(/\r?\n/).map(one => one.trim()).filter(Boolean)
+  for (const line of found) {
+    const dir = line.replace(/[\\/][^\\/]+$/, '')
+    for (const exe of [
+      line.toLowerCase().endsWith('.exe') ? line : `${line.replace(/\.(cmd|bat|ps1)$/i, '')}.exe`,
+      `${dir}\\node_modules\\@beads\\bd\\bin\\bd.exe`,
+    ]) {
+      if (await tryRun([exe])) {
+        return { argv: [exe] }
       }
     }
-  } catch {
-    // not Windows, or where.exe missing: nothing more to try
-  }
-  if (await tryRun(['bd'])) {
-    return ['bd']
   }
 
-  return null
+  return {
+    error:
+      found.length === 0
+        ? 'bd not found on PATH'
+        : `found no bd.exe, only ${found.join(', ')}. The plugin won't run bd through a shell shim, where cmd.exe cuts every argument at its first newline; put bd.exe on PATH (the npm package bundles one)`,
+  }
 }
 
 const runOnce = async ($: Engine, argv: string[], stdin: string | undefined, timeoutMs: number, what: string): Promise<RunResult> => {
@@ -203,14 +218,24 @@ const runOnce = async ($: Engine, argv: string[], stdin: string | undefined, tim
 // Never throws: a timeout or a failed start reads as exit 124. One retry on a
 // lock error, or on a timeout of a command that creates nothing.
 const bd = async ($: Engine, args: string[], stdin?: string): Promise<RunResult> => {
-  bdArgv ??= await findBd($)
+  // Only a found bd is kept: one installed later is found on the next call.
   if (bdArgv === null) {
-    return { exitCode: 127, stdout: '', stderr: 'bd not found on PATH' }
+    const found = await findBd($)
+    if ('error' in found) {
+      return { exitCode: 127, stdout: '', stderr: found.error }
+    }
+    bdArgv = found.argv
   }
-  const first = await runOnce($, [...bdArgv, ...args], stdin, BD_TIMEOUT_MS, 'bd')
+  const argv = [...bdArgv, ...args]
+  const first = await runOnce($, argv, stdin, BD_TIMEOUT_MS, 'bd')
 
-  return shouldRetry(args, first) ? runOnce($, [...bdArgv, ...args], stdin, BD_TIMEOUT_MS, 'bd') : first
+  return shouldRetry(args, first) ? runOnce($, argv, stdin, BD_TIMEOUT_MS, 'bd') : first
 }
+
+// Closes a gate with its reason on stdin: bd close takes the text whole, of
+// any length, where gate resolve only takes an argument. A gate already
+// closed stays closed with its first reason, so a retry is harmless.
+const closeGate = ($: Engine, id: string, reason: string) => bd($, ['close', id, '--reason-file', '-'], reason)
 
 // ---- the beads store signature ----
 
@@ -409,28 +434,22 @@ const refreshSoon = ($: Engine, force = false) => {
   }
 }
 
-// The timer's tick: with a store signature, read bd only when it changed or
-// the list has grown old; without one, every tick (or each minute when the
-// tick is the signature's short one).
+// The timer's tick, every check interval. A snapshot command is the cheap
+// look itself, so it runs every tick. Otherwise bd is read when the store's
+// signature changed, and whatever it says once the list is a full refresh
+// interval old (the only reads when there is no signature).
 const poll = async ($: Engine) => {
-  if (settings.snapshot.length > 0 || !settings.storeSignature) {
+  if (settings.snapshot.length > 0) {
     return refresh($)
   }
+  const isOld = (await clockNow($)) - lastRefreshAt >= settings.refreshMs
   const signature = await readSignature($)
-  const isOld = (await clockNow($)) - lastRefreshAt >= MAX_AGE_MS
-  if (signature === undefined) {
-    return settings.pollMs !== undefined || isOld ? refresh($) : undefined
-  }
-  if (signature !== lastSignature || isOld) {
+  if (signature !== undefined && signature !== lastSignature) {
     return refresh($, { signature })
   }
 
-  return undefined
+  return isOld ? refresh($, { signature }) : undefined
 }
-
-const pollInterval = (): number =>
-  settings.pollMs ??
-  (settings.snapshot.length > 0 ? POLL_SNAPSHOT_MS : settings.storeSignature ? POLL_SIGNATURE_MS : POLL_DIRECT_MS)
 
 const showStatus = async ($: Engine) => {
   if (!(await read($, error))) {
@@ -622,15 +641,16 @@ const leaveFeedback = async (
 const feedbackContext = (beadId: string, kind: AttnKind, title: string, notes: string) =>
   `[bead-inbox] The human left ${kind} on ${beadId}${title}: ${notes}. It is a comment on ${beadId}, which is labelled ${FEEDBACK_LABEL} (and reopened if it was closed). Address it, then remove the ${FEEDBACK_LABEL} label.`
 
-const writeAnswer = async ($: Engine, id: string, item: AttnItem | undefined, answer: string): Promise<Outcome> => {
-  const title = item ? ` ("${truncate(item.title, 80)}")` : ''
+const writeAnswer = async ($: Engine, item: AttnItem, answer: string): Promise<Outcome> => {
+  const id = item.id
+  const title = ` ("${truncate(item.title, 80)}")`
 
-  if (item && isFeedbackKind(item.kind)) {
+  if (isFeedbackKind(item.kind)) {
     // An older review/feedback gate still has to close to unblock its bead;
     // the notes go on that bead either way.
     const target = item.isGate ? item.blocks : item.id
     if (item.isGate) {
-      const r = await bd($, ['gate', 'resolve', id, '--reason', `Human ${item.kind} left on ${target ?? 'the gate'}`])
+      const r = await closeGate($, id, `Human ${item.kind} left on ${target ?? 'the gate'}`)
       if (r.exitCode !== 0) {
         return { text: `Could not resolve ${id}: ${r.stderr.trim()}`, stays: true, recorded: false }
       }
@@ -655,7 +675,7 @@ const writeAnswer = async ($: Engine, id: string, item: AttnItem | undefined, an
 
   // A labelled ordinary issue is work, not a gate: record the answer on it and
   // take the label off, leaving it open for the agent to carry on.
-  if (item && !item.isGate) {
+  if (!item.isGate) {
     const comment = `Human answer: ${answer}`
     const saved = await addComment($, id, comment)
     if (!saved.isSaved) {
@@ -671,14 +691,13 @@ const writeAnswer = async ($: Engine, id: string, item: AttnItem | undefined, an
     }
   }
 
-  // The close reason stays an argument: bd reads it from no file.
-  const r = await bd($, ['gate', 'resolve', id, '--reason', answer])
+  const r = await closeGate($, id, answer)
   if (r.exitCode !== 0) {
     return { text: `Could not resolve ${id}: ${r.stderr.trim()}`, stays: true, recorded: false }
   }
   const problems: string[] = []
   let note = ''
-  if (item?.blocks) {
+  if (item.blocks) {
     const saved = await addComment($, item.blocks, `Human answer to ${id} (${item.title}): ${answer}`)
     if (saved.isSaved) {
       note = saved.note
@@ -686,7 +705,7 @@ const writeAnswer = async ($: Engine, id: string, item: AttnItem | undefined, an
       problems.push(`couldn't comment on ${item.blocks} (${cut(saved.stderr)})`)
     }
   }
-  const unblocked = item?.blocks ? ` ${item.blocks} is unblocked.` : ''
+  const unblocked = item.blocks ? ` ${item.blocks} is unblocked.` : ''
 
   return {
     text: withProblems(`Resolved ${id}${note}`, problems),
@@ -709,39 +728,58 @@ const runOnAnswered = ($: Engine, id: string, blocks: string | undefined) => {
 // The item leaves the inbox before the first bd write (which can wait minutes
 // on the database lock); if the writes fail it comes back where it was, with
 // the reason.
-const resolve = async ($: Engine, id: string, answer: string): Promise<CommandRunResult> => {
+// The item an answer is for: listed, hidden by an answer moments ago, or
+// looked up in bd (an id typed by hand, or one the poll hasn't seen yet).
+const itemFor = async ($: Engine, typed: string): Promise<{ item: AttnItem; position: number } | { text: string }> => {
   const list = await read($, items)
-  const index = list.findIndex(one => one.id === id)
-  const earlier = hidden.get(id)
-  const item = list[index] ?? earlier?.item
-  const position = index >= 0 ? index : (earlier?.position ?? list.length)
-  if (item) {
-    hidden.set(id, { pending: true, at: 0, item, position })
-    await update($, notSaved, reasons => Object.fromEntries(Object.entries(reasons).filter(([one]) => one !== id)))
-    await update($, items, all => all.filter(one => one.id !== id))
-    await showStatus($)
+  const index = list.findIndex(one => one.id === typed)
+  const listed = list[index]
+  if (listed) {
+    return { item: listed, position: index }
   }
+  const earlier = hidden.get(typed)
+  if (earlier) {
+    return { item: earlier.item, position: earlier.position }
+  }
+  const show = await bd($, ['show', typed, '--json'])
+  if (show.exitCode !== 0) {
+    return { text: `Could not look up ${typed}: ${show.stderr.trim()}` }
+  }
+  const found = lookupItem(show.stdout, typed)
+
+  return 'reason' in found ? { text: `Nothing answered: ${found.reason}.` } : { item: found, position: list.length }
+}
+
+const resolve = async ($: Engine, typed: string, answer: string): Promise<CommandRunResult> => {
+  const target = await itemFor($, typed)
+  if ('text' in target) {
+    return { text: target.text }
+  }
+  const { item, position } = target
+  const id = item.id
+  hidden.set(id, { pending: true, at: 0, item, position })
+  await update($, notSaved, reasons => Object.fromEntries(Object.entries(reasons).filter(([one]) => one !== id)))
+  await update($, items, all => all.filter(one => one.id !== id))
+  await showStatus($)
   let outcome: Outcome
   try {
-    outcome = await writeAnswer($, id, item, answer)
+    outcome = await writeAnswer($, item, answer)
   } catch (err) {
     outcome = { text: `Could not answer ${id}: ${errorText(err)}`, stays: true, recorded: false }
   }
-  if (item) {
-    if (outcome.stays) {
-      hidden.delete(id)
-      await update($, items, all =>
-        all.some(one => one.id === id) ? all : [...all.slice(0, position), item, ...all.slice(position)],
-      )
-      await update($, notSaved, reasons => ({ ...reasons, [id]: outcome.text }))
-    } else {
-      hidden.set(id, { pending: false, at: await clockNow($), item, position })
-    }
-    await showStatus($)
+  if (outcome.stays) {
+    hidden.delete(id)
+    await update($, items, all =>
+      all.some(one => one.id === id) ? all : [...all.slice(0, position), item, ...all.slice(position)],
+    )
+    await update($, notSaved, reasons => ({ ...reasons, [id]: outcome.text }))
+  } else {
+    hidden.set(id, { pending: false, at: await clockNow($), item, position })
   }
+  await showStatus($)
   if (outcome.recorded) {
     refreshSoon($, true)
-    runOnAnswered($, id, item?.blocks)
+    runOnAnswered($, id, item.blocks)
   }
 
   return outcome.recorded && outcome.context ? { text: outcome.text, context: outcome.context } : { text: outcome.text }
@@ -910,7 +948,7 @@ export const register: Register = (on, options) => {
     // Only a session with a person at it keeps the band and the pane fresh:
     // background and -p sessions would only add to the lock contention.
     if (isInteractive) {
-      $.clock.every(pollInterval(), () => void poll($))
+      $.clock.every(settings.checkMs, () => void poll($))
       void refresh($)
       void $.ui.open({ id: PANE, title: 'Needs you' }).catch(() => undefined)
     }

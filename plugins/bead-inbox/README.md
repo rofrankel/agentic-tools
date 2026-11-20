@@ -7,7 +7,7 @@ A long-running manager session with many subagents keeps asking questions. Each 
 ## Requirements
 
 - A Claude Code build that loads plugin hook modules (`hooks/hooks.json` with `"modules"`)
-- [`bd`](https://github.com/steveyegge/beads) on your PATH, or installed with npm (the plugin finds the real `bd.exe` behind npm's Windows shim)
+- [`bd`](https://github.com/steveyegge/beads) on your PATH, or installed with npm. On Windows the plugin needs a real `bd.exe`: on PATH, or the one the npm package bundles behind its `bd.cmd` shim, which it finds by itself. It never runs bd through a shim, because cmd.exe cuts every argument at its first newline without an error. With only a shim it says so in the inbox instead.
 - Claude Code started in a repo with a beads database (`.beads/`), or `BEADS_DIR` set. There is one inbox per database, so projects that share a database share an inbox.
 
 ## Install
@@ -25,7 +25,7 @@ A long-running manager session with many subagents keeps asking questions. Each 
 - **`/inbox` pane:** everything, grouped by kind, with details and buttons (Open, Approve, Answer…, Reject…, Dismiss). It scrolls, so nothing is cut off. `/inbox [kind] [project:<name>]` filters it (a project includes its subprojects: `project:web` holds `web:api`, not `webapp`); in a mixed inbox each row's project tag is a button that filters to that project, and the filter bar's Clear shows everything again. Bare `/inbox` clears the filter.
 - **Bead pane** (Open, or `/inbox-open <id>`): the full bead, its comments, and what it blocks. Markdown links (`[text](url)`) in descriptions and comments are drawn as links.
 
-Only an interactive session polls; background agents and `claude -p` runs read `bd` only when a command or `ask_human` runs, so they don't add to lock contention. Each poll first takes a cheap signature of the beads store (for Dolt, each database's journal size and a hash of its manifest: file metadata and one small read, no `bd` process) and reads `bd` only when it changed, or once the list is a minute old. That lets the poll run every 10 seconds at almost no cost. A store it doesn't recognise falls back to reading `bd` every 60 seconds. It also reads after any `bd` command or subagent return, and at once after your answer.
+Only an interactive session polls; background agents and `claude -p` runs read `bd` only when a command or `ask_human` runs, so they don't add to lock contention. Each poll first takes a cheap signature of the beads store (for Dolt, each database's journal size and a hash of its manifest: file metadata and one small read, no `bd` process) and reads `bd` only when it changed, or once the list is a full refresh interval old (60 seconds). That lets the check run every 10 seconds at almost no cost. A store it doesn't recognise is read every full refresh interval. It also reads after any `bd` command or subagent return, and at once after your answer.
 
 ### Answering is instant
 
@@ -85,7 +85,7 @@ bd label add <gate-id> attn:decision,project:<name>
 
 The manager also receives one hidden line naming your answer, so it can act without asking you.
 
-Comment text (answers, notes) goes to `bd` on standard input, and the plugin prefers the real `bd.exe` over npm's `bd.cmd` shim, so a multi-line answer arrives whole. A gate's close reason is still a command-line argument (`bd gate resolve` reads it from no file): on an install with only the shim, a multi-line reason is cut at its first line, though the full answer still lands in the comment on the blocked bead.
+Your text goes to `bd` on standard input: comments through `bd comments add -f -`, and a gate's answer through `bd close --reason-file -`, which closes a gate exactly as `bd gate resolve` does but takes its reason whole. So a multi-line answer arrives intact, quotes, `&`, `%` and `^` included, at any length. An id that isn't in the inbox (typed by hand, or not polled yet) is looked up first. Only an open human gate or an `attn:`-labelled bead is answered, so a typo can never close ordinary work.
 
 ## Settings
 
@@ -95,7 +95,8 @@ Set these in `/config`. Each defaults to the behaviour described above.
 | --- | --- | --- |
 | Extractor model | `sonnet` | The model the backup uses (`haiku`, `sonnet` or `opus`) |
 | Auto-extract questions from subagent reports | on | Turn off when your agents file their own questions |
-| Poll interval (seconds) | 0 (auto) | Auto: 10s with a store signature, 15s with a snapshot command, else 60s |
+| Change check interval (seconds) | 10 | How often an interactive session looks for a change: the store signature, or the snapshot command when one is set |
+| Full refresh interval (seconds) | 60 | `bd` is read at least this often whatever the check finds; without a store signature, this is how often it's read |
 | Read bd only when the beads store changed | on | The store-signature check before each poll |
 | Snapshot command | empty | A command that prints `{"gates": [...], "attn": [...], "error"?: "...", "started"?: <epoch seconds>}` in place of the plugin's two `bd list` calls, for setups where several sessions share one database and a cheaper shared reader exists. `gates` is what `bd list --type gate --status open --json --limit 0` prints, `attn` the `attn:*`-labelled list, `started` when the reads behind it began. Writes still go through `bd` |
 | Snapshot force arguments | empty | Added to the snapshot command after the plugin's own writes, so the reader skips its cache |

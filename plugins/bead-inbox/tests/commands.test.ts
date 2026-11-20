@@ -108,7 +108,7 @@ test('an id works without its prefix', async ($, on) => {
   expect(text).toContain('/answer api-2')
 
   await run($ as never, 'approve', '2 looks good')
-  expect(calls.find(one => one[0] === 'gate' && one[1] === 'resolve')?.slice(0, 3)).toEqual(['gate', 'resolve', 'api-2'])
+  expect(calls.find(one => one[0] === 'close')).toEqual(['close', 'api-2', '--reason-file', '-'])
   await settled()
 })
 
@@ -118,9 +118,7 @@ test('/inbox-dismiss resolves the gate for the agent to judge', async ($, on) =>
   const text = await run($ as never, 'inbox-dismiss', 'api-2')
 
   expect(text).toContain('Resolved api-2')
-  expect(calls.find(one => one[0] === 'gate' && one[1] === 'resolve')?.slice(0, 4)).toEqual([
-    'gate', 'resolve', 'api-2', '--reason',
-  ])
+  expect(calls.find(one => one[0] === 'close')).toEqual(['close', 'api-2', '--reason-file', '-'])
   await settled()
 })
 

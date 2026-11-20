@@ -26,7 +26,9 @@ const issue = (id: string, kind: string): Row => ({
   labels: [`attn:${kind}`],
 })
 
-const fakeBd = (on: never, rows: Row[], fail: (call: Call) => Reply | undefined = () => undefined) => {
+// `unlisted` beads are in bd but not in its list output: what bd show finds
+// for an id the poll hasn't seen.
+const fakeBd = (on: never, rows: Row[], fail: (call: Call) => Reply | undefined = () => undefined, unlisted: Row[] = []) => {
   const calls: Call[] = []
   const comments = new Map<string, { text: string; created_at: string }[]>()
   ;(on as (event: string, hook: unknown) => void)('process.run', async (_$: unknown, e: { argv: string[]; init?: { stdin?: string } }) => {
@@ -48,8 +50,8 @@ const fakeBd = (on: never, rows: Row[], fail: (call: Call) => Reply | undefined 
     if (verb === 'list') {
       return answer({ stdout: JSON.stringify(rows.filter(one => one.status !== 'closed')) })
     }
-    if (verb === 'gate' && sub === 'resolve') {
-      const row = rows.find(one => one.id === id)
+    if (verb === 'close') {
+      const row = [...rows, ...unlisted].find(one => one.id === sub)
       if (row) {
         row.status = 'closed'
       }
@@ -70,7 +72,8 @@ const fakeBd = (on: never, rows: Row[], fail: (call: Call) => Reply | undefined 
       return answer({})
     }
     if (verb === 'show') {
-      return answer({ stdout: JSON.stringify([{ id: sub, title: 'Work', status: 'open', labels: [] }]) })
+      const known = [...rows, ...unlisted].find(one => one.id === sub)
+      return answer({ stdout: JSON.stringify([known ?? { id: sub, title: 'Work', status: 'open', issue_type: 'task', labels: [] }]) })
     }
 
     return answer({})
@@ -96,15 +99,15 @@ const mount = ($: unknown) =>
     ...PANE,
   })
 
-test('a gate resolve that hits the lock is retried once and succeeds', async ($, on) => {
+test('a gate close that hits the lock is retried once and succeeds', async ($, on) => {
   let tries = 0
   const { calls } = fakeBd(on as never, [gate('g-1', 'decision')], call =>
-    is(call, 'gate', 'resolve') && (tries += 1) === 1 ? { exitCode: 1, stderr: 'Error: database is locked' } : undefined,
+    is(call, 'close') && (tries += 1) === 1 ? { exitCode: 1, stderr: 'Error: database is locked' } : undefined,
   )
   await run($, 'inbox')
 
   expect(await run($, 'answer', 'g-1 use A')).toContain('Resolved g-1')
-  expect(calls.filter(call => is(call, 'gate', 'resolve'))).toHaveLength(2)
+  expect(calls.filter(call => is(call, 'close'))).toHaveLength(2)
 })
 
 test('a timed-out comment add is not retried blindly: the comments are read again first', async ($, on) => {
@@ -145,7 +148,7 @@ test('a quick second answer to a hidden item is not saved twice', async ($, on) 
   const second = await run($, 'answer', 't-1 use A')
 
   expect(calls.filter(call => is(call, 'comments', 'add'))).toHaveLength(1)
-  expect(calls.filter(call => is(call, 'gate', 'resolve'))).toHaveLength(0)
+  expect(calls.filter(call => is(call, 'close'))).toHaveLength(0)
   expect(second).toContain('already saved')
 })
 
@@ -195,7 +198,7 @@ test('an answered item is gone at once, and stays gone while its write is held b
     release = done
   })
   fakeBd(on as never, [gate('g-1', 'decision'), gate('g-2', 'decision')], call =>
-    is(call, 'gate', 'resolve') ? held : undefined,
+    is(call, 'close') ? held : undefined,
   )
   await run($, 'inbox')
   const answering = run($, 'answer', 'g-1 use A')
@@ -214,7 +217,7 @@ test('an answered item is gone at once, and stays gone while its write is held b
 
 test('a failed answer puts the item back with "Not saved"', async ($, on) => {
   fakeBd(on as never, [gate('g-1', 'decision')], call =>
-    is(call, 'gate', 'resolve') ? { exitCode: 1, stderr: 'no such gate' } : undefined,
+    is(call, 'close') ? { exitCode: 1, stderr: 'no such gate' } : undefined,
   )
   await run($, 'inbox')
   expect(await run($, 'answer', 'g-1 use A')).toContain('Could not resolve g-1')
@@ -266,4 +269,41 @@ test('two refreshes started together share one round of bd list calls', async ($
   await Promise.all([run($, 'inbox'), run($, 'inbox-list')])
 
   expect(calls.filter(call => call.args[0] === 'list')).toHaveLength(2)
+})
+
+test("a multi-line gate answer reaches bd close whole, on stdin", async ($, on) => {
+  const { calls } = fakeBd(on as never, [gate('g-1', 'decision', 'w-1')])
+  await run($, 'inbox')
+  const answer = 'use A\nbecause "B" & C cost 100% more ^ twice'
+  await run($, 'answer', `g-1 ${answer}`)
+
+  const close = calls.find(call => is(call, 'close'))
+  expect(close?.args).toEqual(['close', 'g-1', '--reason-file', '-'])
+  expect(close?.stdin).toBe(answer)
+  expect(calls.find(call => is(call, 'comments', 'add', 'w-1'))?.stdin).toBe(`Human answer to g-1 (Question g-1?): ${answer}`)
+})
+
+test('an id typed by hand for ordinary work is not closed', async ($, on) => {
+  const { calls } = fakeBd(on as never, [])
+  const text = await run($, 'answer', 'task-9 done')
+
+  expect(text).toContain('Nothing answered: task-9 is neither a human gate nor labelled attn:*')
+  expect(calls.filter(call => is(call, 'close') || is(call, 'comments', 'add'))).toEqual([])
+})
+
+test('a gate the poll has not seen yet is looked up and answered', async ($, on) => {
+  const { calls } = fakeBd(on as never, [], undefined, [gate('g-9', 'decision', 'w-9')])
+  const text = await run($, 'answer', 'g-9 go')
+
+  expect(text).toContain('Resolved g-9')
+  expect(calls.find(call => is(call, 'close'))?.stdin).toBe('go')
+  expect(calls.find(call => is(call, 'comments', 'add', 'w-9'))).toBeDefined()
+})
+
+test('a closed gate typed by hand says so and writes nothing', async ($, on) => {
+  const closed = { ...gate('g-8', 'decision'), status: 'closed' }
+  const { calls } = fakeBd(on as never, [], undefined, [closed])
+
+  expect(await run($, 'answer', 'g-8 go')).toContain('Nothing answered: g-8 is already closed')
+  expect(calls.filter(call => is(call, 'close'))).toEqual([])
 })
