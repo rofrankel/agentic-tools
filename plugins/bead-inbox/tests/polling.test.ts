@@ -182,18 +182,22 @@ test('forced refreshes during a slow one cause exactly one more', async ($, on) 
 })
 
 test('the on-answered command runs once per saved answer, never for a failed one', { options: { onAnsweredCommand: 'dispatch --now' } }, async ($, on) => {
-  const calls = fakeRun(on, [gate('g-1'), gate('g-2')], call =>
+  const blocking = { ...gate('g-1'), description: 'Ad-hoc gate blocking w-1' }
+  const calls = fakeRun(on, [blocking, gate('g-2'), gate('g-3')], call =>
     call.argv[1] === 'gate' && call.argv[3] === 'g-2' ? answer('', 1, 'no such gate') : undefined,
   )
   await run($, 'inbox')
   await run($, 'answer', 'g-1 A')
   await run($, 'answer', 'g-2 B')
+  await run($, 'answer', 'g-3 C')
   await settled()
 
   const dispatched = calls.filter(call => call.argv[0] === 'dispatch')
-  expect(dispatched).toHaveLength(1)
-  expect(dispatched[0]?.argv).toEqual(['dispatch', '--now'])
-  expect(dispatched[0]?.env?.BEAD_INBOX_ID).toBe('g-1')
+  expect(dispatched.map(call => call.argv)).toEqual([
+    ['dispatch', '--now', '--id', 'g-1', '--blocks', 'w-1'],
+    ['dispatch', '--now', '--id', 'g-3'],
+  ])
+  expect(dispatched.every(call => call.env === undefined)).toBe(true)
 })
 
 // ---- §9b: the real bd, and comments on stdin ----

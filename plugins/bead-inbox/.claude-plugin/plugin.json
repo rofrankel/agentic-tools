@@ -49,7 +49,7 @@
     "onAnsweredCommand": {
       "type": "string",
       "title": "On-answered command",
-      "description": "Optional command run (not awaited, 30s timeout) after every saved answer, with BEAD_INBOX_ID and BEAD_INBOX_BLOCKS in its environment, so a dispatcher can act at once.",
+      "description": "Optional command run (not awaited, 30s timeout) after every saved answer, with --id <answered id> and, when a bead was unblocked, --blocks <bead id> appended, so a dispatcher can act at once.",
       "default": ""
     }
   }

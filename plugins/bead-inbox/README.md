@@ -99,7 +99,7 @@ Set these in `/config`. Each defaults to the behaviour described above.
 | Read bd only when the beads store changed | on | The store-signature check before each poll |
 | Snapshot command | empty | A command that prints `{"gates": [...], "attn": [...], "error"?: "...", "started"?: <epoch seconds>}` in place of the plugin's two `bd list` calls, for setups where several sessions share one database and a cheaper shared reader exists. `gates` is what `bd list --type gate --status open --json --limit 0` prints, `attn` the `attn:*`-labelled list, `started` when the reads behind it began. Writes still go through `bd` |
 | Snapshot force arguments | empty | Added to the snapshot command after the plugin's own writes, so the reader skips its cache |
-| On-answered command | empty | Run after every saved answer (not awaited, 30s timeout, exit code ignored), with `BEAD_INBOX_ID` and `BEAD_INBOX_BLOCKS` set, so a dispatcher can act at once. Runs in background sessions too |
+| On-answered command | empty | Run after every saved answer (not awaited, 30s timeout, exit code ignored), with `--id <answered id>` appended, and `--blocks <bead id>` when the answer unblocked a bead, so a dispatcher can act at once. Runs in background sessions too |
 
 ## Development
 

@@ -697,16 +697,13 @@ const writeAnswer = async ($: Engine, id: string, item: AttnItem | undefined, an
 }
 
 // Tells an outside dispatcher at once; never awaited, its failures ignored.
+// What was answered goes as named arguments, the command's whole input.
 const runOnAnswered = ($: Engine, id: string, blocks: string | undefined) => {
   if (settings.onAnswered.length === 0) {
     return
   }
-  void $.process
-    .run(settings.onAnswered, {
-      timeoutMs: ON_ANSWERED_TIMEOUT_MS,
-      env: { BEAD_INBOX_ID: id, BEAD_INBOX_BLOCKS: blocks ?? '' },
-    })
-    .catch(() => undefined)
+  const argv = [...settings.onAnswered, '--id', id, ...(blocks ? ['--blocks', blocks] : [])]
+  void $.process.run(argv, { timeoutMs: ON_ANSWERED_TIMEOUT_MS }).catch(() => undefined)
 }
 
 // The item leaves the inbox before the first bd write (which can wait minutes
