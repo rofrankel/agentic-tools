@@ -373,3 +373,70 @@ test('with no store files polling falls back to a fixed minute', async ($, on) =
   await clock.advance(10_000)
   expect(lists(calls)).toBe(4)
 })
+
+// ---- §11: failures ----
+
+test('a failed refresh keeps the last list and backs off before trying again', { options: { storeSignature: false } }, async ($, on) => {
+  host(on)
+  const clock = mock.clock(on as never, { now: 1_000_000 })
+  let isBroken = false
+  const calls = fakeRun(on, [gate('g-1')], call => (isBroken && call.argv[1] === 'list' ? answer('', 1, 'boom') : undefined))
+  await start($, true)
+  await clock.settle()
+  expect(lists(calls)).toBe(2)
+
+  isBroken = true
+  await clock.advance(60_000)
+  expect(lists(calls)).toBe(4)
+  // Then 10s, 20s, 40s, and the full minute at most.
+  await clock.advance(10_000)
+  expect(lists(calls)).toBe(6)
+  await clock.advance(10_000)
+  expect(lists(calls)).toBe(6)
+  await clock.advance(10_000)
+  expect(lists(calls)).toBe(8)
+  await clock.advance(30_000)
+  expect(lists(calls)).toBe(8)
+  await clock.advance(10_000)
+  expect(lists(calls)).toBe(10)
+
+  const text = await run($, 'inbox-list')
+  expect(text).toContain('bd failed: boom')
+  expect(text).toContain('g-1')
+
+  isBroken = false
+  await clock.advance(60_000)
+  expect(await run($, 'inbox-list')).not.toContain('bd failed')
+})
+
+test('a bd that is not found is looked for again only after a minute', async ($, on) => {
+  const clock = mock.clock(on as never, { now: 1_000_000 })
+  const calls = fakeRun(on, [gate('g-1')], call => {
+    if (call.argv[0] === 'where.exe') {
+      return answer('')
+    }
+    return call.argv[0] === 'bd.exe' ? answer('', 1, 'not found') : undefined
+  })
+  const probes = () => calls.filter(call => call.argv[0] === 'where.exe').length
+
+  expect(await run($, 'inbox')).toContain('bd not found on PATH')
+  expect(probes()).toBe(1)
+  await run($, 'inbox')
+  expect(probes()).toBe(1)
+  await clock.advance(60_000)
+  await run($, 'inbox')
+  expect(probes()).toBe(2)
+})
+
+test("ask_human's duplicate check reads past the snapshot cache", { options: { snapshotCommand: 'snap', snapshotForceArgs: '--fresh' } }, async ($, on) => {
+  const calls = fakeRun(on, [], call =>
+    call.argv[0] === 'snap' ? answer(JSON.stringify({ gates: [], attn: [], started: 1 })) : undefined,
+  )
+  await ($ as { tool: { call: (input: object) => Promise<unknown> } }).tool.call({
+    tool: 'mcp__bead-inbox__ask_human',
+    kind: 'decision',
+    question: 'Postgres or SQLite?',
+  })
+
+  expect(calls.find(call => call.argv[0] === 'snap')?.argv).toEqual(['snap', '--fresh'])
+})

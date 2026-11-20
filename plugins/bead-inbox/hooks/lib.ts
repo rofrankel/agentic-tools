@@ -430,7 +430,7 @@ export const HELP: readonly (readonly [string, readonly string[]])[] = [
     'Troubleshooting',
     [
       '"No beads database found": start Claude Code in the repo that holds .beads, or set BEADS_DIR.',
-      '"bd failed": the pane shows bd\'s error. On Windows the plugin runs a real bd.exe (on PATH, or the one bundled behind npm\'s shim), never a shell shim, which would cut every argument at its first newline; with only a shim the error says so. Answers go to bd on stdin, so multi-line answers arrive whole. It waits up to 120s for bd and retries once on a database lock.',
+      '"bd failed": the pane shows bd\'s error above the last list read, and tries again after the check interval, doubling each time up to the full refresh interval (sooner when the store changes). On Windows the plugin runs a real bd.exe (on PATH, or the one bundled behind npm\'s shim), never a shell shim, which would cut every argument at its first newline; with only a shim the error says so. Answers go to bd on stdin, so multi-line answers arrive whole. It waits up to 120s for bd and retries once on a database lock.',
       'Pane not showing at startup: it opens by itself only at 144+ columns; use /inbox.',
       'After editing the plugin: /reload-plugins.',
     ],

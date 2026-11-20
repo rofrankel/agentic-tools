@@ -307,3 +307,33 @@ test('a closed gate typed by hand says so and writes nothing', async ($, on) => 
   expect(await run($, 'answer', 'g-8 go')).toContain('Nothing answered: g-8 is already closed')
   expect(calls.filter(call => is(call, 'close'))).toEqual([])
 })
+
+test('a second answer while the first is still saving sends nothing and says so', async ($, on) => {
+  let release: () => void = () => undefined
+  const held = new Promise<void>(done => {
+    release = done
+  })
+  const { calls } = fakeBd(on as never, [gate('g-1', 'decision')], call => (is(call, 'close') ? held : undefined))
+  await run($, 'inbox')
+  const first = run($, 'answer', 'g-1 use A')
+  await settled()
+
+  expect(await run($, 'answer', 'g-1 use B')).toContain('still saving')
+  release()
+  expect(await first).toContain('Resolved g-1')
+  expect(calls.filter(call => is(call, 'close'))).toHaveLength(1)
+})
+
+test('a partly saved answer runs the on-answered command once, not again on its retry', { options: { onAnsweredCommand: 'dispatch' } }, async ($, on) => {
+  let removes = 0
+  const { calls } = fakeBd(on as never, [issue('t-1', 'question')], call =>
+    is(call, 'label', 'remove') && (removes += 1) === 1 ? { exitCode: 1, stderr: 'database is busy' } : undefined,
+  )
+  await run($, 'inbox')
+  expect(await run($, 'answer', 't-1 use A')).toContain('stays in the inbox')
+  await run($, 'answer', 't-1 use A')
+  await settled()
+
+  expect(removes).toBe(2)
+  expect(calls.filter(call => call.argv[0] === 'dispatch')).toHaveLength(1)
+})

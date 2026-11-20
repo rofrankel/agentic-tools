@@ -64,6 +64,7 @@ const DISMISSED = 'Dismissed by the human without an answer; use your judgment.'
 const BD_TIMEOUT_MS = 120_000
 const SNAPSHOT_TIMEOUT_MS = 120_000
 const ON_ANSWERED_TIMEOUT_MS = 30_000
+const BD_MISSING_RETRY_MS = 60_000
 // The defaults of the two poll settings, in seconds.
 const CHECK_SECONDS = 10
 const REFRESH_SECONDS = 60
@@ -127,6 +128,8 @@ const readSettings = (options: PluginOptions | undefined): Settings => {
 
 let settings = readSettings(undefined)
 let bdArgv: string[] | null = null
+let bdMissing: { at: number; error: string } | undefined
+let bdProbe: Promise<{ argv: string[] } | { error: string }> | null = null
 let seen: Set<string> | null = null
 let sessionFolder: string | undefined
 let isInteractive = false
@@ -143,6 +146,9 @@ const hidden = new Map<string, { pending: boolean; at: number; item: AttnItem; p
 // A comment that saved while the label removal after it failed, by bead: the
 // same answer again only retries the label.
 const labelStuck = new Map<string, string>()
+// The answer the on-answered command last ran for, by item, while the item
+// stays in the inbox after it (partly saved).
+const kicked = new Map<string, string>()
 
 const errorText = (err: unknown): string =>
   err instanceof Error ? err.message : typeof err === 'string' ? err : 'unknown error'
@@ -218,12 +224,23 @@ const runOnce = async ($: Engine, argv: string[], stdin: string | undefined, tim
 // Never throws: a timeout or a failed start reads as exit 124. One retry on a
 // lock error, or on a timeout of a command that creates nothing.
 const bd = async ($: Engine, args: string[], stdin?: string): Promise<RunResult> => {
-  // Only a found bd is kept: one installed later is found on the next call.
+  // A found bd is kept. A miss is kept for a minute, so a machine with only a
+  // shim doesn't probe (up to a minute of version calls) on every bd call,
+  // and one installed later is still found. Calls at once share one probe.
   if (bdArgv === null) {
-    const found = await findBd($)
+    if (bdMissing && (await clockNow($)) - bdMissing.at < BD_MISSING_RETRY_MS) {
+      return { exitCode: 127, stdout: '', stderr: bdMissing.error }
+    }
+    bdProbe ??= findBd($).finally(() => {
+      bdProbe = null
+    })
+    const found = await bdProbe
     if ('error' in found) {
+      bdMissing = { at: await clockNow($), error: found.error }
+
       return { exitCode: 127, stdout: '', stderr: found.error }
     }
+    bdMissing = undefined
     bdArgv = found.argv
   }
   const argv = [...bdArgv, ...args]
@@ -340,7 +357,10 @@ const readSnapshot = async ($: Engine, force: boolean): Promise<Reads> => {
 }
 
 let lastSignature: string | undefined
-let lastRefreshAt = Number.NEGATIVE_INFINITY
+// When the poll reads bd whatever the signature says: a full refresh
+// interval after a success, sooner (backing off) after failures.
+let retryAt = Number.NEGATIVE_INFINITY
+let failures = 0
 
 const doRefresh = async ($: Engine, force: boolean, known?: string): Promise<void> => {
   const started = await clockNow($)
@@ -348,23 +368,31 @@ const doRefresh = async ($: Engine, force: boolean, known?: string): Promise<voi
   const signature = known ?? (await readSignature($))
   const reads = settings.snapshot.length > 0 ? await readSnapshot($, force) : await readDirect($)
   await update($, now, () => started)
+  // A failure keeps the last list on show (with no database there is none)
+  // and waits before the next try: the check interval, doubling up to the
+  // full refresh interval, or sooner if the store changes.
+  const fail = async (text: string, isNoDb = false) => {
+    if (isNoDb) {
+      await update($, items, () => [])
+    }
+    await update($, error, () => text)
+    $.ui.status(isNoDb ? undefined : '⚑ inbox: bd failed (see /inbox)')
+    failures += 1
+    lastSignature = signature
+    retryAt = started + Math.min(settings.refreshMs, settings.checkMs * 2 ** (failures - 1))
+  }
   if ('error' in reads) {
-    await update($, items, () => [])
-    await update($, error, () => reads.error)
-    $.ui.status(reads.isNoDb ? undefined : '⚑ inbox: bd failed (see /inbox)')
-
-    return
+    return fail(reads.error, reads.isNoDb)
   }
   let all: AttnItem[]
   try {
     all = parseGates(reads.gates, reads.attn)
   } catch {
-    await update($, error, () => 'could not parse bd output')
-
-    return
+    return fail('could not parse bd output')
   }
+  failures = 0
   lastSignature = signature
-  lastRefreshAt = started
+  retryAt = started + settings.refreshMs
 
   // An answer in flight stays hidden whatever these reads saw; a finished one
   // until reads that began after it. Then bd is trusted again.
@@ -439,10 +467,11 @@ const refreshSoon = ($: Engine, force = false) => {
 // signature changed, and whatever it says once the list is a full refresh
 // interval old (the only reads when there is no signature).
 const poll = async ($: Engine) => {
+  const isOld = (await clockNow($)) >= retryAt
   if (settings.snapshot.length > 0) {
-    return refresh($)
+    // Every tick, except while backing off from a failure.
+    return failures === 0 || isOld ? refresh($) : undefined
   }
-  const isOld = (await clockNow($)) - lastRefreshAt >= settings.refreshMs
   const signature = await readSignature($)
   if (signature !== undefined && signature !== lastSignature) {
     return refresh($, { signature })
@@ -558,7 +587,7 @@ const addComment = async ($: Engine, beadId: string, text: string): Promise<Save
     try {
       const parsed = jsonFrom(list.stdout, [])
 
-      return Array.isArray(parsed) ? recentDuplicate(parsed as RawComment[], text, Date.now()) : undefined
+      return Array.isArray(parsed) ? recentDuplicate(parsed as RawComment[], text, await clockNow($)) : undefined
     } catch {
       return undefined
     }
@@ -567,7 +596,7 @@ const addComment = async ($: Engine, beadId: string, text: string): Promise<Save
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const earlier = await alreadySaved()
     if (earlier !== undefined) {
-      return { isSaved: true, note: savedNote(earlier, Date.now()) }
+      return { isSaved: true, note: savedNote(earlier, await clockNow($)) }
     }
     last = await bd($, ['comments', 'add', beadId, '-f', '-'], text)
     if (last.exitCode === 0) {
@@ -757,6 +786,11 @@ const resolve = async ($: Engine, typed: string, answer: string): Promise<Comman
   }
   const { item, position } = target
   const id = item.id
+  // One answer per item at a time: a second would overwrite the first's
+  // record, and its failure would bring back an item the first answered.
+  if (hidden.get(id)?.pending) {
+    return { text: `An answer to ${id} is still saving; nothing else was sent. Try again once it finishes if it fails.` }
+  }
   hidden.set(id, { pending: true, at: 0, item, position })
   await update($, notSaved, reasons => Object.fromEntries(Object.entries(reasons).filter(([one]) => one !== id)))
   await update($, items, all => all.filter(one => one.id !== id))
@@ -779,7 +813,16 @@ const resolve = async ($: Engine, typed: string, answer: string): Promise<Comman
   await showStatus($)
   if (outcome.recorded) {
     refreshSoon($, true)
-    runOnAnswered($, id, item.blocks)
+    // Once per answer: a partly saved one (its label stuck) has told the
+    // dispatcher already, so its retry doesn't again.
+    if (kicked.get(id) !== answer) {
+      runOnAnswered($, id, item.blocks)
+    }
+    if (outcome.stays) {
+      kicked.set(id, answer)
+    } else {
+      kicked.delete(id)
+    }
   }
 
   return outcome.recorded && outcome.context ? { text: outcome.text, context: outcome.context } : { text: outcome.text }
@@ -864,16 +907,17 @@ const loadBead = async ($: Engine, beadId: string, blocksId: string | undefined)
 // What the list commands reply: bd's error, an empty note, or the items.
 const replyWith = async ($: Engine, list: AttnItem[] | undefined, empty: string, details: boolean) => {
   const failure = await read($, error)
-  if (failure) {
+  const all = await read($, items)
+  if (failure && all.length === 0) {
     return { text: failure }
   }
+  const stale = failure ? `${failure}\nThe last list read before that:\n\n` : ''
   if (!list || list.length === 0) {
-    return { text: empty }
+    return { text: stale + empty }
   }
-  const all = await read($, items)
 
   return {
-    text: listText(list, await read($, now), { details, projects: isMixed(all) }),
+    text: stale + listText(list, await read($, now), { details, projects: isMixed(all) }),
   }
 }
 
@@ -987,8 +1031,9 @@ export const register: Register = (on, options) => {
     const blocks = input.blocks?.trim() || undefined
     const project = await projectFor($, blocks, input.project)
 
-    // A retry of a call that filed but failed to answer must not file again.
-    await refresh($)
+    // A retry of a call that filed but failed to answer must not file again,
+    // so the check reads past a snapshot reader's cache.
+    await refresh($, { force: true })
     const existing = (await read($, items)).find(
       one =>
         isRepeat(one, question, project) ||
@@ -1376,7 +1421,7 @@ export const register: Register = (on, options) => {
     const chosen = await read($, filter)
     const reasons = await read($, notSaved)
 
-    if (failure) {
+    if (failure && list.length === 0) {
       return <Text color="warning" wrap="wrap">{failure}</Text>
     }
     const filtered = isFiltered(chosen)
@@ -1388,6 +1433,15 @@ export const register: Register = (on, options) => {
     const mixed = isMixed(list)
     const colorOf = projectColors(list.map(one => one.project))
     const rows: RenderChildren[] = []
+    if (failure) {
+      rows.push(
+        <Box key="failure" marginBottom={1}>
+          <Text color="warning" wrap="wrap">
+            {failure} Showing the last list read.
+          </Text>
+        </Box>,
+      )
+    }
     if (filtered) {
       rows.push(
         <Box key="filter" flexDirection="row" gap={1} marginBottom={1}>
